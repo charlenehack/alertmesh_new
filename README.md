@@ -76,104 +76,105 @@ curl http://localhost:8080/healthz
 
 ---
 
-### 方式二：裸机手动部署（Ubuntu / Debian）
+### 方式二：裸机手动部署
 
-#### 1. 安装系统依赖
+> **核心思路**：Go 和 Node.js **只在编译机上需要**，生产服务器只需安装 PostgreSQL（和可选的 Nginx），
+> 把编译产物传过去直接运行即可。
+
+#### 阶段一：在编译机上构建产物
+
+编译机可以是你的开发机、CI 服务器，任意安装了 Go 和 Node.js 的机器。
+
+**编译机依赖**
+
+| 依赖 | 最低版本 |
+|------|----------|
+| Go | 1.22+ |
+| Node.js | 18+ |
 
 ```bash
-apt-get update && apt-get install -y curl git openssl
+git clone <repo-url> alertmesh && cd alertmesh
 
-# ── 安装 Go 1.22+ ──────────────────────────────────────────────────
-wget https://go.dev/dl/go1.22.5.linux-amd64.tar.gz
-tar -C /usr/local -xzf go1.22.5.linux-amd64.tar.gz
-echo 'export PATH=$PATH:/usr/local/go/bin' >> /etc/profile
-source /etc/profile
-go version   # 确认输出 go1.22.x
+# 编译后端二进制（单文件，无外部依赖）
+go build -trimpath -ldflags "-s -w" -o alertmesh ./cmd/alertmesh/
 
-# ── 安装 Node.js 20+ ───────────────────────────────────────────────
-curl -fsSL https://deb.nodesource.com/setup_20.x | bash -
-apt-get install -y nodejs
-node -v   # 确认输出 v20.x
+# 构建前端静态文件
+cd web && npm install && npx vite build && cd ..
+# ⚠️ 不要用 npm run build，会做 TS 类型检查可能报错
 
-# ── 安装 PostgreSQL 15+ ────────────────────────────────────────────
-apt-get install -y postgresql
-systemctl enable postgresql && systemctl start postgresql
+# 构建完成后产物：
+#   ./alertmesh        ← 后端二进制
+#   ./web/dist/        ← 前端静态文件目录
 ```
 
-#### 2. 初始化数据库
+#### 阶段二：在生产服务器上准备环境
+
+**生产服务器依赖**（无需 Go / Node.js）
+
+| 依赖 | 最低版本 | 说明 |
+|------|----------|------|
+| PostgreSQL | 15+ | 主数据库 |
+| Nginx | 任意 | 反向代理 + 静态文件（可选）|
+| OpenSSL | 任意 | 生成加密密钥 |
 
 ```bash
+# Ubuntu / Debian
+apt-get install -y postgresql nginx openssl
+systemctl enable postgresql && systemctl start postgresql
+
+# 创建数据库和用户
 sudo -u postgres psql << 'SQL'
 CREATE USER alertmesh WITH PASSWORD '替换为强密码';
 CREATE DATABASE alertmesh OWNER alertmesh;
 \q
 SQL
 
-# 验证连接
-psql -U alertmesh -h localhost -d alertmesh -c "SELECT 1;"
+# 创建部署目录
+mkdir -p /opt/alertmesh/web/dist
 ```
 
-#### 3. 拉取代码
+#### 阶段三：上传产物并配置
 
 ```bash
-git clone <repo-url> /opt/alertmesh
-cd /opt/alertmesh
+# 在编译机上执行，将产物传到生产服务器
+SERVER=user@your-production-server
+
+scp alertmesh                  $SERVER:/opt/alertmesh/alertmesh
+scp -r web/dist                $SERVER:/opt/alertmesh/web/
+scp .env.example               $SERVER:/opt/alertmesh/.env
 ```
 
-#### 4. 配置环境变量
+**在生产服务器上**编辑 `.env`：
 
 ```bash
-cp .env.example .env
-vim .env
+vim /opt/alertmesh/.env
 ```
 
-`.env` 关键配置项：
+关键配置项：
 
 ```dotenv
 # ── 必填 ──────────────────────────────────────────────────────────
-ALERTMESH_DATABASE_DSN=postgres://alertmesh:替换为强密码@localhost:5432/alertmesh?sslmode=disable
+ALERTMESH_DATABASE_DSN=postgres://alertmesh:密码@localhost:5432/alertmesh?sslmode=disable
 ALERTMESH_ENCRYPTION_KEY=<执行 openssl rand -base64 32 的输出>   # ⚠️ 生成后不可更改
 
 # ── 基础配置 ──────────────────────────────────────────────────────
-ALERTMESH_SERVER_PORT=8080       # HTTP 监听端口
-ALERTMESH_LOG_LEVEL=info         # info / debug / warn
-ALERTMESH_LOG_FORMAT=json        # json（生产） / pretty（调试）
-ALERTMESH_AI_WORKERS=2           # AI 分析并发 worker 数
+ALERTMESH_SERVER_PORT=8080
+ALERTMESH_LOG_LEVEL=info
+ALERTMESH_LOG_FORMAT=json
+ALERTMESH_AI_WORKERS=2
 
-# ── 可选：AI 根因分析数据源 ────────────────────────────────────────
+# ── 可选 ─────────────────────────────────────────────────────────
 # ALERTMESH_PROMETHEUS_URL=http://prometheus:9090
 # ALERTMESH_OPENSEARCH_URL=http://opensearch:9200
-
-# ── 可选：Redis 缓存 ───────────────────────────────────────────────
 # ALERTMESH_REDIS_ENABLED=true
 # ALERTMESH_REDIS_ADDR=localhost:6379
-
-# ── 可选：Nginx 配置下发（运维操作功能） ───────────────────────────
 # NGINX_WORK_DIR=/opt/alertmesh/work
 # ALERTMESH_ANSIBLE_USER=root
 # ALERTMESH_ANSIBLE_PASSWORD=ssh密码
 # ALERTMESH_ANSIBLE_NGINX_BIN=/usr/sbin/nginx
 ```
 
-#### 5. 编译后端
-
-```bash
-cd /opt/alertmesh
-go build -trimpath -ldflags "-s -w" -o alertmesh ./cmd/alertmesh/
-ls -lh alertmesh   # 确认二进制文件存在
-```
-
-#### 6. 构建前端
-
-```bash
-cd /opt/alertmesh/web
-npm install
-npx vite build        # ⚠️ 不要用 npm run build，会做 TS 类型检查可能报错
-ls dist/              # 确认 index.html 存在
-cd /opt/alertmesh
-```
-
-#### 7. 配置 systemd 服务（开机自启）
+#### 阶段四：配置 systemd 并启动
 
 ```bash
 # 创建专用运行用户
@@ -275,20 +276,22 @@ nginx -t && systemctl reload nginx
 ### 升级（后续版本更新）
 
 ```bash
-cd /opt/alertmesh
-
-# 1. 拉取最新代码
+# 在编译机上执行
 git pull
 
-# 2. 重新编译后端
+# 重新编译后端
 go build -trimpath -ldflags "-s -w" -o alertmesh ./cmd/alertmesh/
 
-# 3. 重新构建前端
+# 重新构建前端
 cd web && npm install && npx vite build && cd ..
 
-# 4. 重启服务（数据库迁移自动执行）
-systemctl restart alertmesh
-systemctl status alertmesh
+# 将新产物传到生产服务器
+SERVER=user@your-production-server
+scp alertmesh        $SERVER:/opt/alertmesh/alertmesh
+scp -r web/dist      $SERVER:/opt/alertmesh/web/
+
+# 在生产服务器上重启（数据库迁移自动执行）
+ssh $SERVER 'systemctl restart alertmesh && systemctl status alertmesh'
 ```
 
 ---
