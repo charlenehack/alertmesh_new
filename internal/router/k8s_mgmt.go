@@ -333,7 +333,7 @@ func (h *k8sMgmtHandler) k8sClient(dsID string) (client *http.Client, baseURL st
 		DialContext:         (&net.Dialer{Timeout: 10 * time.Second}).DialContext,
 		TLSHandshakeTimeout: 10 * time.Second,
 	}
-	client = &http.Client{Timeout: 20 * time.Second, Transport: transport}
+	client = &http.Client{Timeout: 60 * time.Second, Transport: transport}
 	return client, baseURL, token, nil
 }
 
@@ -634,11 +634,62 @@ func (h *k8sMgmtHandler) listServices(req *restful.Request, resp *restful.Respon
 
 func (h *k8sMgmtHandler) listIngresses(req *restful.Request, resp *restful.Response) {
 	ns := req.QueryParameter("namespace")
-	path := "/apis/networking.k8s.io/v1/ingresses"
-	if ns != "" {
-		path = "/apis/networking.k8s.io/v1/namespaces/" + ns + "/ingresses"
+	dsID := req.QueryParameter("ds")
+	if dsID == "" {
+		httputil.BadRequest(resp, "缺少 ?ds=<cluster-id> 参数")
+		return
 	}
-	h.proxyK8s(req, resp, path)
+	client, baseURL, token, err := h.k8sClient(dsID)
+	if err != nil {
+		httputil.BadRequest(resp, err.Error())
+		return
+	}
+
+	// 按 K8s 版本依次降级尝试 Ingress API
+	groups := []string{
+		"networking.k8s.io/v1",
+		"networking.k8s.io/v1beta1",
+		"extensions/v1beta1",
+	}
+	var lastBody []byte
+	for _, g := range groups {
+		var path string
+		if ns != "" {
+			path = "/apis/" + g + "/namespaces/" + ns + "/ingresses"
+		} else {
+			path = "/apis/" + g + "/ingresses"
+		}
+		fullURL := baseURL + path
+		k8sReq, _ := http.NewRequestWithContext(req.Request.Context(), http.MethodGet, fullURL, nil)
+		if token != "" {
+			k8sReq.Header.Set("Authorization", "Bearer "+token)
+		}
+		k8sReq.Header.Set("Accept", "application/json")
+		k8sResp, err := client.Do(k8sReq)
+		if err != nil {
+			httputil.InternalError(resp, "Kubernetes API 请求失败: "+err.Error())
+			return
+		}
+		body, _ := io.ReadAll(io.LimitReader(k8sResp.Body, 32*1024*1024))
+		_ = k8sResp.Body.Close()
+		if k8sResp.StatusCode == http.StatusNotFound {
+			lastBody = body
+			continue // 该版本 API 不存在，尝试下一个
+		}
+		if k8sResp.StatusCode >= 400 {
+			httputil.Error(resp, k8sResp.StatusCode, fmt.Sprintf("Kubernetes API error: %s", string(body)))
+			return
+		}
+		var result any
+		if err := json.Unmarshal(body, &result); err != nil {
+			httputil.InternalError(resp, fmt.Sprintf("解析 Kubernetes API 响应失败 (body=%d bytes): %v", len(body), err))
+			return
+		}
+		httputil.Success(resp, result)
+		return
+	}
+	// 所有版本均 404
+	httputil.Error(resp, http.StatusNotFound, fmt.Sprintf("该集群不支持 Ingress API: %s", string(lastBody)))
 }
 
 func (h *k8sMgmtHandler) listPVCs(req *restful.Request, resp *restful.Response) {
@@ -670,11 +721,11 @@ func (h *k8sMgmtHandler) clusterSummary(req *restful.Request, resp *restful.Resp
 	}
 	ctx := req.Request.Context()
 
-	fetch := func(path string) map[string]any {
+	fetch := func(path string) (map[string]any, int) {
 		u := baseURL + path
 		r, e := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
 		if e != nil {
-			return nil
+			return nil, 0
 		}
 		if token != "" {
 			r.Header.Set("Authorization", "Bearer "+token)
@@ -682,17 +733,20 @@ func (h *k8sMgmtHandler) clusterSummary(req *restful.Request, resp *restful.Resp
 		r.Header.Set("Accept", "application/json")
 		res, e := client.Do(r)
 		if e != nil {
-			return nil
+			return nil, 0
 		}
 		defer func() { _ = res.Body.Close() }()
-		body, _ := io.ReadAll(io.LimitReader(res.Body, 2*1024*1024))
+		body, _ := io.ReadAll(io.LimitReader(res.Body, 32*1024*1024))
+		if res.StatusCode >= 400 {
+			return nil, res.StatusCode
+		}
 		out := map[string]any{}
 		_ = json.Unmarshal(body, &out)
-		return out
+		return out, res.StatusCode
 	}
 
-	nodeList := fetch("/api/v1/nodes")
-	metricsList := fetch("/apis/metrics.k8s.io/v1beta1/nodes") // may be nil if metrics-server not installed
+	nodeList, nodesStatus := fetch("/api/v1/nodes?limit=500")
+	metricsList, _ := fetch("/apis/metrics.k8s.io/v1beta1/nodes") // may be nil if metrics-server not installed
 
 	// --- parse nodes ---
 	totalNodes, readyNodes := 0, 0
@@ -765,6 +819,7 @@ func (h *k8sMgmtHandler) clusterSummary(req *restful.Request, resp *restful.Resp
 		"cpu_request_rate":  rateOrNeg(totalCapCPUm-totalAllocCPUm, totalCapCPUm),
 		"mem_request_rate":  rateOrNeg(totalCapMemKi-totalAllocMemKi, totalCapMemKi),
 		"metrics_available": metricsAvailable,
+		"nodes_status":      nodesStatus, // 节点 API 返回的 HTTP 状态码，0 表示请求失败
 	})
 }
 
@@ -1499,13 +1554,43 @@ func (h *k8sMgmtHandler) deleteService(req *restful.Request, resp *restful.Respo
 
 // ── Ingresses write ────────────────────────────────────────────────────────────
 
+// ingressAPIGroup 探测集群支持的 Ingress API group，依次尝试 v1 → v1beta1 → extensions/v1beta1
+func (h *k8sMgmtHandler) ingressAPIGroup(ctx context.Context, client *http.Client, baseURL, token, ns, name string) string {
+	groups := []string{"networking.k8s.io/v1", "networking.k8s.io/v1beta1", "extensions/v1beta1"}
+	for _, g := range groups {
+		path := "/apis/" + g + "/namespaces/" + ns + "/ingresses/" + name
+		req, _ := http.NewRequestWithContext(ctx, http.MethodGet, baseURL+path, nil)
+		if token != "" {
+			req.Header.Set("Authorization", "Bearer "+token)
+		}
+		req.Header.Set("Accept", "application/json")
+		resp, err := client.Do(req)
+		if err != nil {
+			return g // 网络错误时返回当前 group，由调用方处理
+		}
+		_, _ = io.Copy(io.Discard, resp.Body)
+		_ = resp.Body.Close()
+		if resp.StatusCode != http.StatusNotFound {
+			return g
+		}
+	}
+	return "networking.k8s.io/v1" // 降级失败，返回默认值
+}
+
 func (h *k8sMgmtHandler) getIngress(req *restful.Request, resp *restful.Response) {
 	ns, name, ok := nsName(req)
 	if !ok {
 		httputil.BadRequest(resp, "缺少 namespace 或 name 参数")
 		return
 	}
-	h.doGet(req, resp, "/apis/networking.k8s.io/v1/namespaces/"+ns+"/ingresses/"+name)
+	dsID := req.QueryParameter("ds")
+	client, baseURL, token, err := h.k8sClient(dsID)
+	if err != nil {
+		httputil.BadRequest(resp, err.Error())
+		return
+	}
+	g := h.ingressAPIGroup(req.Request.Context(), client, baseURL, token, ns, name)
+	h.doGet(req, resp, "/apis/"+g+"/namespaces/"+ns+"/ingresses/"+name)
 }
 
 func (h *k8sMgmtHandler) updateIngress(req *restful.Request, resp *restful.Response) {
@@ -1514,9 +1599,16 @@ func (h *k8sMgmtHandler) updateIngress(req *restful.Request, resp *restful.Respo
 		httputil.BadRequest(resp, "缺少 namespace 或 name 参数")
 		return
 	}
+	dsID := req.QueryParameter("ds")
+	client, baseURL, token, err := h.k8sClient(dsID)
+	if err != nil {
+		httputil.BadRequest(resp, err.Error())
+		return
+	}
+	g := h.ingressAPIGroup(req.Request.Context(), client, baseURL, token, ns, name)
 	body, _ := io.ReadAll(io.LimitReader(req.Request.Body, 4*1024*1024))
 	h.doWrite(req, resp, http.MethodPut,
-		"/apis/networking.k8s.io/v1/namespaces/"+ns+"/ingresses/"+name,
+		"/apis/"+g+"/namespaces/"+ns+"/ingresses/"+name,
 		"application/json", body)
 }
 
@@ -1526,8 +1618,15 @@ func (h *k8sMgmtHandler) deleteIngress(req *restful.Request, resp *restful.Respo
 		httputil.BadRequest(resp, "缺少 namespace 或 name 参数")
 		return
 	}
+	dsID := req.QueryParameter("ds")
+	client, baseURL, token, err := h.k8sClient(dsID)
+	if err != nil {
+		httputil.BadRequest(resp, err.Error())
+		return
+	}
+	g := h.ingressAPIGroup(req.Request.Context(), client, baseURL, token, ns, name)
 	h.doWrite(req, resp, http.MethodDelete,
-		"/apis/networking.k8s.io/v1/namespaces/"+ns+"/ingresses/"+name,
+		"/apis/"+g+"/namespaces/"+ns+"/ingresses/"+name,
 		"", nil)
 }
 
