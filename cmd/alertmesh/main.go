@@ -16,6 +16,7 @@ import (
 	"github.com/kuzane/alertmesh/internal/incident"
 	"github.com/kuzane/alertmesh/internal/ingestion"
 	"github.com/kuzane/alertmesh/internal/realtime"
+	"github.com/kuzane/alertmesh/internal/router"
 	"github.com/kuzane/alertmesh/pkg/logger"
 )
 
@@ -91,6 +92,10 @@ func main() {
 	app.Orchestrator.Stop()
 	app.Pipeline.Stop()
 	rootCancel()
+
+	// Gracefully close K8s Informer Watch connections to avoid
+	// lingering connections on the K8s API server.
+	router.ShutdownK8sCache(ctx)
 
 	if err := app.Server.Shutdown(ctx); err != nil {
 		log.Error().Err(err).Msg("server shutdown error")

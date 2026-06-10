@@ -31,6 +31,8 @@ import (
 	"github.com/kuzane/alertmesh/internal/model"
 )
 
+var k8sCacheMgr *k8scache.Manager
+
 // k8sMgmtHandler proxies read-only Kubernetes API requests through a
 // configured k8s data-source row.  The frontend passes ?ds=<data-source-id>
 // on every request so the user can switch between clusters.
@@ -44,11 +46,21 @@ type k8sMgmtHandler struct {
 }
 
 func newK8sMgmtHandler(db *gorm.DB, cfg *cfgpkg.Config) *k8sMgmtHandler {
+	cm := k8scache.NewManager(db, cfg)
+	k8sCacheMgr = cm
 	return &k8sMgmtHandler{
 		db:       db,
 		cfg:      cfg,
 		agent:    ai_pkg.NewAgent(db, cfg),
-		cacheMgr: k8scache.NewManager(db, cfg),
+		cacheMgr: cm,
+	}
+}
+
+// ShutdownK8sCache stops all K8s Informer connections gracefully.
+// Call this from main.go during application shutdown.
+func ShutdownK8sCache(ctx context.Context) {
+	if k8sCacheMgr != nil {
+		k8sCacheMgr.Shutdown(ctx)
 	}
 }
 
