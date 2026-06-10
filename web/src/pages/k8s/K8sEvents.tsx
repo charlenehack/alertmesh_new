@@ -5,15 +5,14 @@
  */
 import { useState, useMemo } from 'react'
 import { useQuery } from '@tanstack/react-query'
-import { Table, Tag, Space, Alert, Button, Input, Select, Switch, InputNumber, Badge, Tooltip } from 'antd'
-import { ReloadOutlined, WarningOutlined, RobotOutlined } from '@ant-design/icons'
+import { Table, Tag, Space, Alert, Button, Input, Select, Switch, InputNumber, Badge } from 'antd'
+import { ReloadOutlined, WarningOutlined } from '@ant-design/icons'
 import { PageHeader } from '../../components/PageHeader'
 import { SurfaceCard } from '../../components/SurfaceCard'
 import { useTheme } from '../../hooks/useTheme'
 import { http } from '../../api/request'
 import { useClusters, useSelectedCluster, useNamespaces, useAutoRefresh, k8sPagination } from './useCluster'
 import { ClusterSelector } from './ClusterSelector'
-import { K8sAIDrawer } from './K8sAIDrawer'
 
 interface K8sEvent {
   metadata?: { name?: string; namespace?: string; creationTimestamp?: string }
@@ -34,10 +33,8 @@ export default function K8sEvents() {
   const { dsId, select } = useSelectedCluster(clusters)
 
   const [ns, setNs] = useState('')
-  const [typeFilter, setTypeFilter] = useState('')  // '' | 'Warning' | 'Normal'
+  const [typeFilter, setTypeFilter] = useState('')
   const [search, setSearch] = useState('')
-  const [aiOpen, setAiOpen] = useState(false)
-  const [aiTarget, setAiTarget] = useState<{ event: K8sEvent; text: string } | null>(null)
 
   const { data, isLoading, error, refetch } = useQuery<EventList>({
     queryKey: ['k8s-global-events', dsId, ns, typeFilter],
@@ -71,17 +68,6 @@ export default function K8sEvents() {
   }, [data, search])
 
   const warningCount = (data?.items ?? []).filter(e => e.type === 'Warning').length
-
-  // 将当前 Warning 事件整理成 AI 分析文本
-  const eventsForAI = useMemo(() => {
-    return events
-      .filter(e => e.type === 'Warning')
-      .slice(0, 100)
-      .map(e =>
-        `[${e.type}] ${e.involvedObject?.kind ?? ''}/${e.involvedObject?.name ?? ''} (${e.metadata?.namespace ?? e.involvedObject?.namespace ?? ''}) 原因:${e.reason ?? ''} 次数:${e.count ?? 1} 消息:${e.message ?? ''} @${fmtTime(e.lastTimestamp)}`
-      )
-      .join('\n')
-  }, [events])
 
   const columns = [
     {
@@ -117,21 +103,10 @@ export default function K8sEvents() {
       ),
     },
     {
-      // 消息列：允许换行，内嵌 AI 分析按钮
       title: '消息',
-      render: (_: unknown, e: K8sEvent) => {
-        const text = `[${e.type}] ${e.involvedObject?.kind ?? ''}/${e.involvedObject?.name ?? ''} (${e.metadata?.namespace ?? e.involvedObject?.namespace ?? ''}) 原因:${e.reason ?? ''} 次数:${e.count ?? 1} 消息:${e.message ?? ''} @${fmtTime(e.lastTimestamp)}`
-        return (
-          <div style={{ display: 'flex', alignItems: 'flex-start', gap: 4 }}>
-            <span style={{ fontSize: 12, wordBreak: 'break-word', whiteSpace: 'pre-wrap', flex: 1 }}>{e.message}</span>
-            <Tooltip title="AI 分析此事件">
-              <Button size="small" type="text" icon={<RobotOutlined />}
-                style={{ color: '#722ed1', flexShrink: 0, marginTop: -2 }}
-                onClick={() => setAiTarget({ event: e, text })} />
-            </Tooltip>
-          </div>
-        )
-      },
+      render: (_: unknown, e: K8sEvent) => (
+        <span style={{ fontSize: 12, wordBreak: 'break-word', whiteSpace: 'pre-wrap' }}>{e.message}</span>
+      ),
     },
     {
       title: '来源组件', width: 150,
@@ -162,16 +137,6 @@ export default function K8sEvents() {
         extra={
           <Space>
             <ClusterSelector clusters={clusters ?? []} value={dsId} onChange={select} />
-            <Tooltip title={warningCount === 0 ? '暂无 Warning 事件' : `分析 ${warningCount} 条 Warning 事件`}>
-              <Button
-                icon={<RobotOutlined />}
-                onClick={() => setAiOpen(true)}
-                disabled={warningCount === 0}
-                style={{ color: '#722ed1', borderColor: '#722ed1' }}
-              >
-                AI 分析
-              </Button>
-            </Tooltip>
             <Button icon={<ReloadOutlined />} onClick={() => refetch()} loading={isLoading}>刷新</Button>
           </Space>
         }
@@ -212,26 +177,6 @@ export default function K8sEvents() {
           />
         )}
       </SurfaceCard>
-      {/* 全局 Warning 事件 AI 分析 */}
-      <K8sAIDrawer
-        open={aiOpen}
-        onClose={() => setAiOpen(false)}
-        resourceKind="Cluster"
-        namespace={ns || 'all'}
-        name="Events"
-        analysisKind="events"
-        content={eventsForAI}
-      />
-      {/* 单条事件 AI 分析 */}
-      <K8sAIDrawer
-        open={!!aiTarget}
-        onClose={() => setAiTarget(null)}
-        resourceKind={aiTarget?.event.involvedObject?.kind ?? 'Resource'}
-        namespace={aiTarget?.event.metadata?.namespace ?? aiTarget?.event.involvedObject?.namespace ?? ''}
-        name={aiTarget?.event.involvedObject?.name ?? ''}
-        analysisKind="events"
-        content={aiTarget?.text ?? ''}
-      />
     </>
   )
 }

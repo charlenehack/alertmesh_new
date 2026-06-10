@@ -21,7 +21,7 @@ import { PageHeader } from '../../components/PageHeader'
 import { SurfaceCard } from '../../components/SurfaceCard'
 import { useTheme } from '../../hooks/useTheme'
 import { http } from '../../api/request'
-import { useClusters, useSelectedCluster, byCreation, k8sPagination, fmtCreation, useNamespaces, useAutoRefresh } from './useCluster'
+import { useClusters, useSelectedCluster, byCreation, fmtCreation, useNamespaces, useAutoRefresh, useK8sList } from './useCluster'
 import { ClusterSelector } from './ClusterSelector'
 import { YamlEditor } from './YamlEditor'
 import { ConfigMapsTab } from './K8sConfigMaps'
@@ -139,17 +139,29 @@ function PodsTab({ dsId, selectorFilter = '', nsFilter = '', nodeFilterProp = ''
   const [terminalTarget, setTerminalTarget] = useState<{ ns: string; name: string; container: string } | null>(null)
   const [describeTarget, setDescribeTarget] = useState<{ ns: string; name: string } | null>(null)
 
-  const { data, isLoading, error, refetch } = useQuery<PodList>({
-    queryKey: ['k8s-pods', dsId, ns],
-    queryFn: () => http.get<PodList>('/k8s/pods', {
-      params: { ds: dsId, ...(ns ? { namespace: ns } : {}) },
-    }),
-    enabled: !!dsId,
-    staleTime: 10_000,
+  const {
+    data: pods,
+    isLoading,
+    error,
+    refetch,
+    pagination,
+    search: searchValue,
+    doSearch,
+    phase,
+    setPhase,
+    nodeName: nodeNameFilter,
+    setNodeName,
+    ready,
+    setReady,
+  } = useK8sList<PodItem>('/k8s/pods', {
+    dsId,
+    namespace: ns || undefined,
+    pageSize: 20,
+    searchDelay: 300,
   })
 
   const { data: namespaces = [] } = useNamespaces(dsId)
-  const autoRefresh = useAutoRefresh(() => refetch(), 0)
+  const autoRefresh = useAutoRefresh(refetch, 0)
 
   // 获取单个 pod 详情用于 YAML 查看
   const { data: podDetail, isFetching: podFetching } = useK8sGet(
@@ -161,7 +173,7 @@ function PodsTab({ dsId, selectorFilter = '', nsFilter = '', nodeFilterProp = ''
   const deleteMut = useMutation({
     mutationFn: ({ ns, name }: { ns: string; name: string }) =>
       http.delete(`/k8s/pod?ds=${dsId}&namespace=${ns}&name=${name}`),
-    onSuccess: () => { message.success('Pod 已删除'); qc.invalidateQueries({ queryKey: ['k8s-pods', dsId] }) },
+    onSuccess: () => { message.success('Pod 已删除'); refetch() },
     onError: (e: Error) => message.error(e.message),
   })
 
@@ -169,7 +181,7 @@ function PodsTab({ dsId, selectorFilter = '', nsFilter = '', nodeFilterProp = ''
   // Pod 资源用量（metrics-server，不可用时降级为空）
   interface PodMetric { metadata?: { name?: string; namespace?: string }; containers?: { name: string; usage: { cpu?: string; memory?: string } }[] }
   const { data: metricsData } = useQuery<{ items?: PodMetric[] }>({
-    queryKey: ['k8s-pod-metrics', dsId, ns],
+    queryKey: ['k8s-pod-metrics', dsId, ns, searchValue, phase],
     queryFn: () => http.get('/k8s/pod/metrics', { params: { ds: dsId, ...(ns ? { namespace: ns } : {}) } }),
     enabled: !!dsId,
     staleTime: 15_000,
@@ -201,27 +213,11 @@ function PodsTab({ dsId, selectorFilter = '', nsFilter = '', nodeFilterProp = ''
 
   const allStatuses = useMemo(() => {
     const set = new Set<string>();
-    (data?.items ?? []).forEach(p => set.add(podDerivedStatus(p)))
+    (pods ?? []).forEach(p => set.add(podDerivedStatus(p)))
     return Array.from(set).sort()
-  }, [data])
+  }, [pods])
 
   const selectorPairs = selectorFilter ? selectorFilter.split(',').map(s => s.split('=')).filter(p => p.length === 2) : []
-  const pods = (data?.items ?? []).filter(p => {
-    if (search && !(p.metadata?.name ?? '').toLowerCase().includes(search.toLowerCase())) return false
-    if (phaseFilter && podDerivedStatus(p) !== phaseFilter) return false
-    if (nodeFilter && !(p.spec?.nodeName ?? '').toLowerCase().includes(nodeFilter.toLowerCase())) return false
-    if (selectorPairs.length > 0) {
-      const labels = p.metadata?.labels ?? {}
-      if (!selectorPairs.every(([k, v]) => labels[k] === v)) return false
-    }
-    if (readyFilter) {
-      const total = (p.spec?.containers ?? []).length
-      const ready = (p.status?.containerStatuses ?? []).filter(cs => cs.ready).length
-      if (readyFilter === 'ready' && ready !== total) return false
-      if (readyFilter === 'notready' && ready === total) return false
-    }
-    return true
-  }).sort(byCreation)
 
   const columns = [
     {
@@ -343,18 +339,18 @@ function PodsTab({ dsId, selectorFilter = '', nsFilter = '', nodeFilterProp = ''
           options={namespaces.map(n => ({ label: n, value: n }))}
         />
         <Input.Search placeholder="搜索 Pod 名称" allowClear style={{ width: 200 }}
-          onSearch={setSearch} onChange={e => !e.target.value && setSearch('')} />
-        <Select style={{ width: 160 }} placeholder="状态" allowClear value={phaseFilter || undefined}
-          onChange={v => setPhaseFilter(v ?? '')}
+          onSearch={doSearch} onChange={e => !e.target.value && doSearch('')} />
+        <Select style={{ width: 160 }} placeholder="状态" allowClear value={phase || undefined}
+          onChange={v => { setPhase(v ?? ''); setPage(1) }}
           options={allStatuses.map(s => ({ label: s, value: s }))} />
-        <Select style={{ width: 110 }} placeholder="READY" allowClear value={readyFilter || undefined}
-          onChange={v => setReadyFilter(v ?? '')}
+        <Select style={{ width: 110 }} placeholder="READY" allowClear value={ready || undefined}
+          onChange={v => setReady(v ?? '')}
           options={[
             { label: '全部就绪', value: 'ready' },
             { label: '未就绪', value: 'notready' },
           ]} />
         <Input.Search placeholder="节点名" allowClear style={{ width: 200 }}
-          onSearch={setNodeFilter} onChange={e => !e.target.value && setNodeFilter('')} />
+          onSearch={setNodeName} onChange={e => !e.target.value && setNodeName('')} />
         <Button icon={<ReloadOutlined />} onClick={() => refetch()} loading={isLoading}>刷新</Button>
         <Space size={4}>
           <Switch
@@ -378,7 +374,7 @@ function PodsTab({ dsId, selectorFilter = '', nsFilter = '', nodeFilterProp = ''
       {error && <Alert type="error" message={(error as Error).message} style={{ marginBottom: 8 }} />}
       <Table dataSource={pods} columns={columns} rowKey={p => `${p.metadata?.namespace}/${p.metadata?.name}`}
         loading={isLoading} size="small" scroll={{ x: 'max-content' }}
-        pagination={k8sPagination} />
+        pagination={pagination} />
 
       <YamlEditor
         title={`Pod: ${viewTarget?.name ?? ''}`}
@@ -412,17 +408,22 @@ function DeploymentsTab({ dsId }: { dsId: string }) {
   const [rollbackTarget, setRollbackTarget] = useState<{ ns: string; name: string } | null>(null)
   const [selectedRevision, setSelectedRevision] = useState<string | null>(null)
 
-  const { data, isLoading, error, refetch } = useQuery<DeployList>({
-    queryKey: ['k8s-deployments', dsId, ns],
-    queryFn: () => http.get<DeployList>('/k8s/deployments', {
-      params: { ds: dsId, ...(ns ? { namespace: ns } : {}) },
-    }),
-    enabled: !!dsId,
-    staleTime: 10_000,
+  const {
+    data: deploys,
+    isLoading,
+    error,
+    refetch,
+    pagination,
+    doSearch,
+  } = useK8sList<DeployItem>('/k8s/deployments', {
+    dsId,
+    namespace: ns || undefined,
+    pageSize: 20,
+    searchDelay: 300,
   })
 
   const { data: namespaces = [] } = useNamespaces(dsId)
-  const autoRefresh = useAutoRefresh(() => refetch(), 0)
+  const autoRefresh = useAutoRefresh(refetch, 0)
 
   // 获取单个 deploy JSON
   const [getTarget, setGetTarget] = useState<{ ns: string; name: string } | null>(null)
@@ -444,14 +445,14 @@ function DeploymentsTab({ dsId }: { dsId: string }) {
   const scaleMut = useMutation({
     mutationFn: ({ ns, name, replicas }: { ns: string; name: string; replicas: number }) =>
       http.post(`/k8s/deployment/scale?ds=${dsId}&namespace=${ns}&name=${name}`, { replicas }),
-    onSuccess: () => { message.success('扩缩容成功'); setScaleTarget(null); qc.invalidateQueries({ queryKey: ['k8s-deployments', dsId] }) },
+    onSuccess: () => { message.success('扩缩容成功'); setScaleTarget(null); refetch() },
     onError: (e: Error) => message.error(e.message),
   })
 
   const restartMut = useMutation({
     mutationFn: ({ ns, name }: { ns: string; name: string }) =>
       http.post(`/k8s/deployment/restart?ds=${dsId}&namespace=${ns}&name=${name}`),
-    onSuccess: () => { message.success('滚动重启已触发'); qc.invalidateQueries({ queryKey: ['k8s-deployments', dsId] }) },
+    onSuccess: () => { message.success('滚动重启已触发'); refetch() },
     onError: (e: Error) => message.error(e.message),
   })
 
@@ -471,7 +472,7 @@ function DeploymentsTab({ dsId }: { dsId: string }) {
       message.success('回滚成功')
       setRollbackTarget(null)
       setSelectedRevision(null)
-      qc.invalidateQueries({ queryKey: ['k8s-deployments', dsId] })
+      refetch()
     },
     onError: (e: Error) => message.error(e.message),
   })
@@ -479,20 +480,16 @@ function DeploymentsTab({ dsId }: { dsId: string }) {
   const deleteMut = useMutation({
     mutationFn: ({ ns, name }: { ns: string; name: string }) =>
       http.delete(`/k8s/deployment?ds=${dsId}&namespace=${ns}&name=${name}`),
-    onSuccess: () => { message.success('Deployment 已删除'); qc.invalidateQueries({ queryKey: ['k8s-deployments', dsId] }) },
+    onSuccess: () => { message.success('Deployment 已删除'); refetch() },
     onError: (e: Error) => message.error(e.message),
   })
 
   const updateMut = useMutation({
     mutationFn: ({ ns, name, body }: { ns: string; name: string; body: string }) =>
       http.put(`/k8s/deployment?ds=${dsId}&namespace=${ns}&name=${name}`, JSON.parse(body)),
-    onSuccess: () => { message.success('Deployment 已更新'); setEditTarget(null); setGetTarget(null); qc.invalidateQueries({ queryKey: ['k8s-deployments', dsId] }) },
+    onSuccess: () => { message.success('Deployment 已更新'); setEditTarget(null); setGetTarget(null); refetch() },
     onError: (e: Error) => message.error(e.message),
   })
-
-  const deploys = (data?.items ?? []).filter(d =>
-    !search || (d.metadata?.name ?? '').toLowerCase().includes(search.toLowerCase())
-  ).sort(byCreation)
 
   const columns = [
     { title: 'Deployment 名称', render: (_: unknown, d: DeployItem) => <Text style={{ fontFamily: 'monospace', fontSize: 12 }}>{d.metadata?.name}</Text> },
@@ -563,7 +560,7 @@ function DeploymentsTab({ dsId }: { dsId: string }) {
           options={namespaces.map(n => ({ label: n, value: n }))}
         />
         <Input.Search placeholder="搜索 Deployment 名称" allowClear style={{ width: 240 }}
-          onSearch={setSearch} onChange={e => !e.target.value && setSearch('')} />
+          onSearch={doSearch} onChange={e => !e.target.value && doSearch('')} />
         <Button icon={<ReloadOutlined />} onClick={() => refetch()} loading={isLoading}>刷新</Button>
         <Space size={4}>
           <Switch size="small" checked={autoRefresh.enabled} onChange={autoRefresh.setEnabled} />
@@ -578,7 +575,7 @@ function DeploymentsTab({ dsId }: { dsId: string }) {
       <Table dataSource={deploys} columns={columns}
         rowKey={d => `${d.metadata?.namespace}/${d.metadata?.name}`}
         loading={isLoading} size="small" scroll={{ x: 'max-content' }}
-        pagination={k8sPagination} />
+        pagination={pagination} />
 
       {/* 扩缩容 Modal */}
       <Modal
@@ -707,21 +704,21 @@ function DaemonSetsTab({ dsId }: { dsId: string }) {
   const restartMut = useMutation({
     mutationFn: ({ ns, name }: { ns: string; name: string }) =>
       http.post(`/k8s/daemonset/restart?ds=${dsId}&namespace=${ns}&name=${name}`),
-    onSuccess: () => { message.success('滚动重启已触发'); qc.invalidateQueries({ queryKey: ['k8s-daemonsets', dsId] }) },
+    onSuccess: () => { message.success('滚动重启已触发'); refetch() },
     onError: (e: Error) => message.error(e.message),
   })
 
   const deleteMut = useMutation({
     mutationFn: ({ ns, name }: { ns: string; name: string }) =>
       http.delete(`/k8s/daemonset?ds=${dsId}&namespace=${ns}&name=${name}`),
-    onSuccess: () => { message.success('DaemonSet 已删除'); qc.invalidateQueries({ queryKey: ['k8s-daemonsets', dsId] }) },
+    onSuccess: () => { message.success('DaemonSet 已删除'); refetch() },
     onError: (e: Error) => message.error(e.message),
   })
 
   const updateMut = useMutation({
     mutationFn: ({ ns, name, body }: { ns: string; name: string; body: string }) =>
       http.put(`/k8s/daemonset?ds=${dsId}&namespace=${ns}&name=${name}`, JSON.parse(body)),
-    onSuccess: () => { message.success('DaemonSet 已更新'); setGetTarget(null); qc.invalidateQueries({ queryKey: ['k8s-daemonsets', dsId] }) },
+    onSuccess: () => { message.success('DaemonSet 已更新'); setGetTarget(null); refetch() },
     onError: (e: Error) => message.error(e.message),
   })
 
@@ -740,7 +737,7 @@ function DaemonSetsTab({ dsId }: { dsId: string }) {
       message.success('回滚成功')
       setDsRollbackTarget(null)
       setDsSelectedRevision(null)
-      qc.invalidateQueries({ queryKey: ['k8s-daemonsets', dsId] })
+      refetch()
     },
     onError: (e: Error) => message.error(e.message),
   })

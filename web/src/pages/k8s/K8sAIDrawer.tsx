@@ -46,11 +46,24 @@ export function K8sAIDrawer({
 
     const BASE = import.meta.env.DEV ? 'http://10.11.12.146:8081' : ''
 
-    // 截断超长内容，避免超出 LLM token 限制
-    const MAX_CONTENT = 12000
-    const truncatedContent = content.length > MAX_CONTENT
-      ? content.slice(0, MAX_CONTENT) + '\n...(内容过长，已截断)'
-      : content
+    // 取最后 N 行而非前 N 个字符——错误通常在日志末尾
+    const MAX_LINES = 500
+    const MAX_CHARS = 50000
+    let finalContent = content
+    let truncationNote = ''
+    if (analysisKind === 'logs' || analysisKind === 'describe') {
+      const lines = content.split('\n')
+      if (lines.length > MAX_LINES) {
+        finalContent = lines.slice(-MAX_LINES).join('\n')
+        truncationNote = `[提示: 共 ${lines.length} 行，仅发送最后 ${MAX_LINES} 行供分析]\n\n`
+      }
+    } else {
+      // 事件等非日志内容按字符数截断
+      if (finalContent.length > MAX_CHARS) {
+        finalContent = finalContent.slice(0, MAX_CHARS)
+        truncationNote = '[提示: 内容过长，仅发送前 50000 字符供分析]\n\n'
+      }
+    }
 
     fetch(`${BASE}/api/v1/k8s/ai/analyze`, {
       method: 'POST',
@@ -63,7 +76,7 @@ export function K8sAIDrawer({
         namespace,
         name,
         analysis_kind: analysisKind,
-        content: truncatedContent,
+        content: truncationNote + finalContent,
       }),
       signal: ctrl.signal,
     })
@@ -75,22 +88,38 @@ export function K8sAIDrawer({
         const reader = res.body!.getReader()
         const decoder = new TextDecoder()
         let buf = ''
+        let hasReceived = false
+        const timeoutId = setTimeout(() => {
+          if (!hasReceived) {
+            ctrl.abort('AI 分析超时，响应时间过长，请重试')
+          }
+        }, 120_000) // 120 秒超时
 
         const pump = async (): Promise<void> => {
           const { done, value } = await reader.read()
-          if (done) return
+          if (done) {
+            clearTimeout(timeoutId)
+            if (!hasReceived) {
+              setError('AI 分析未返回任何内容，请重试')
+            }
+            return
+          }
           buf += decoder.decode(value, { stream: true })
           const lines = buf.split('\n')
           buf = lines.pop() ?? ''
           for (const line of lines) {
             if (!line.startsWith('data:')) continue
-            // slice(6) skips 'data: ' (6 chars) to preserve leading spaces in AI tokens
             const payload = line.startsWith('data: ') ? line.slice(6) : line.slice(5)
-            if (payload === '[DONE]') return
+            if (payload === '[DONE]') {
+              clearTimeout(timeoutId)
+              return
+            }
             if (payload.startsWith('[ERROR]')) {
+              clearTimeout(timeoutId)
               setError(payload.slice(7).trim())
               return
             }
+            hasReceived = true
             // Restore newlines escaped by server
             const text = payload.replace(/\\n/g, '\n')
             setReport(prev => prev + text)
@@ -101,7 +130,7 @@ export function K8sAIDrawer({
       })
       .catch(err => {
         if (err.name !== 'AbortError') {
-          setError(err.message ?? '分析失败')
+          setError(typeof err === 'string' ? err : (err.message ?? '分析失败'))
         }
       })
       .finally(() => setLoading(false))

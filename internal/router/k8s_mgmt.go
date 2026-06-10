@@ -11,18 +11,22 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"sort"
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/gorilla/websocket"
 	restful "github.com/emicklei/go-restful/v3"
+	"golang.org/x/sync/errgroup"
 	"gorm.io/gorm"
 
 	ai_pkg "github.com/kuzane/alertmesh/internal/ai"
 	cfgpkg "github.com/kuzane/alertmesh/internal/config"
 	"github.com/kuzane/alertmesh/internal/httputil"
+	"github.com/kuzane/alertmesh/internal/k8scache"
 	"github.com/kuzane/alertmesh/internal/label"
 	"github.com/kuzane/alertmesh/internal/model"
 )
@@ -34,10 +38,18 @@ type k8sMgmtHandler struct {
 	db    *gorm.DB
 	cfg   *cfgpkg.Config
 	agent *ai_pkg.Agent
+
+	apiGroupCache sync.Map
+	cacheMgr      *k8scache.Manager
 }
 
 func newK8sMgmtHandler(db *gorm.DB, cfg *cfgpkg.Config) *k8sMgmtHandler {
-	return &k8sMgmtHandler{db: db, cfg: cfg, agent: ai_pkg.NewAgent(db, cfg)}
+	return &k8sMgmtHandler{
+		db:       db,
+		cfg:      cfg,
+		agent:    ai_pkg.NewAgent(db, cfg),
+		cacheMgr: k8scache.NewManager(db, cfg),
+	}
 }
 
 func (h *k8sMgmtHandler) registerRoutes(ws *restful.WebService) {
@@ -311,10 +323,12 @@ func (h *k8sMgmtHandler) k8sClient(dsID string) (client *http.Client, baseURL st
 
 	secrets := map[string]string{}
 	if row.SecretEnc != "" && h.cfg != nil && h.cfg.EncryptionKey != "" {
-		if plain, decErr := cfgpkg.Decrypt(row.SecretEnc, h.cfg.EncryptionKey); decErr == nil {
-			_ = json.Unmarshal([]byte(plain), &secrets)
-		} else {
-			_ = json.Unmarshal([]byte(row.SecretEnc), &secrets)
+		plain, decErr := cfgpkg.Decrypt(row.SecretEnc, h.cfg.EncryptionKey)
+		if decErr != nil {
+			return nil, "", "", fmt.Errorf("数据源 %s 凭证解密失败: %w", dsID, decErr)
+		}
+		if err := json.Unmarshal([]byte(plain), &secrets); err != nil {
+			return nil, "", "", fmt.Errorf("数据源 %s 凭证 JSON 解析失败: %w", dsID, err)
 		}
 	}
 
@@ -352,19 +366,21 @@ func (h *k8sMgmtHandler) proxyK8s(req *restful.Request, resp *restful.Response, 
 		return
 	}
 
-	// Append any query params from the original request (e.g. ?namespace=prod)
+	// Build query params: forward caller params (strip ds=)
+	// Frontend can pass ?limit=N and ?continue=token for pagination.
+	// If no limit specified, default to 500 to avoid pulling entire cluster.
+	params := req.Request.URL.Query()
+	params.Del("ds")
+	if params.Get("limit") == "" && params.Get("continue") == "" {
+		params.Set("limit", "500")
+	}
 	fullURL := baseURL + path
-	if qs := req.Request.URL.RawQuery; qs != "" {
-		// strip the ds= param and keep the rest
-		params := req.Request.URL.Query()
-		params.Del("ds")
-		if rest := params.Encode(); rest != "" {
-			sep := "?"
-			if strings.Contains(path, "?") {
-				sep = "&"
-			}
-			fullURL += sep + rest
+	if rest := params.Encode(); rest != "" {
+		sep := "?"
+		if strings.Contains(path, "?") {
+			sep = "&"
 		}
+		fullURL += sep + rest
 	}
 
 	k8sReq, _ := http.NewRequestWithContext(req.Request.Context(), http.MethodGet, fullURL, nil)
@@ -458,11 +474,11 @@ func (h *k8sMgmtHandler) overview(req *restful.Request, resp *restful.Response) 
 	}
 	ctx := req.Request.Context()
 
-	fetch := func(path string) map[string]any {
+	fetch := func(path string) (map[string]any, error) {
 		u := baseURL + path
 		r, e := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
 		if e != nil {
-			return nil
+			return nil, e
 		}
 		if token != "" {
 			r.Header.Set("Authorization", "Bearer "+token)
@@ -470,17 +486,94 @@ func (h *k8sMgmtHandler) overview(req *restful.Request, resp *restful.Response) 
 		r.Header.Set("Accept", "application/json")
 		res, e := client.Do(r)
 		if e != nil {
-			return nil
+			return nil, e
 		}
 		defer func() { _ = res.Body.Close() }()
 		body, _ := io.ReadAll(io.LimitReader(res.Body, 32*1024*1024))
 		out := map[string]any{}
-		_ = json.Unmarshal(body, &out)
-		return out
+		if e := json.Unmarshal(body, &out); e != nil {
+			return nil, e
+		}
+		return out, nil
+	}
+
+	// countViaListMeta uses K8s list metadata to get total count.
+	// With limit=1, K8s returns metadata.remainingItemCount (1.15+).
+	// Falls back to len(items) if remainingItemCount is absent.
+	countViaListMeta := func(data map[string]any) int {
+		if items, ok := data["items"].([]any); ok {
+			total := len(items)
+			if meta, ok := data["metadata"].(map[string]any); ok {
+				if rem, ok := meta["remainingItemCount"]; ok {
+					switch v := rem.(type) {
+					case float64:
+						total += int(v)
+					case json.Number:
+						if n, e := v.Int64(); e == nil {
+							total += int(n)
+						}
+					}
+				}
+			}
+			return total
+		}
+		return 0
+	}
+
+	// 并发请求所有 K8s API:
+	// - nodes/namespaces: 通常数量少（<500），全量拉取以统计 Ready/CPU/Memory
+	// - pods/deployments/daemonsets/statefulsets: 用 limit=1 获取总数，不拉全量数据
+	// - metrics: 全量拉取以汇总使用率
+	g, gctx := errgroup.WithContext(ctx)
+
+	var nodeList, nsList, podCountData, deployCountData, dsCountData, ssCountData, metricsList map[string]any
+
+	g.Go(func() error {
+		var e error
+		nodeList, e = fetch("/api/v1/nodes?limit=500")
+		return e
+	})
+	g.Go(func() error {
+		var e error
+		nsList, e = fetch("/api/v1/namespaces?limit=500")
+		return e
+	})
+	g.Go(func() error {
+		var e error
+		podCountData, e = fetch("/api/v1/pods?limit=1")
+		return e
+	})
+	g.Go(func() error {
+		var e error
+		deployCountData, e = fetch("/apis/apps/v1/deployments?limit=1")
+		return e
+	})
+	g.Go(func() error {
+		var e error
+		dsCountData, e = fetch("/apis/apps/v1/daemonsets?limit=1")
+		return e
+	})
+	g.Go(func() error {
+		var e error
+		ssCountData, e = fetch("/apis/apps/v1/statefulsets?limit=1")
+		return e
+	})
+	g.Go(func() error {
+		if gctx.Err() != nil {
+			return gctx.Err()
+		}
+		var e error
+		metricsList, e = fetch("/apis/metrics.k8s.io/v1beta1/nodes")
+		_ = e
+		return nil // metrics-server 不可用不算致命错误
+	})
+
+	if err := g.Wait(); err != nil {
+		httputil.InternalError(resp, "Kubernetes API 请求失败: "+err.Error())
+		return
 	}
 
 	// --- nodes ---
-	nodeList := fetch("/api/v1/nodes")
 	totalNodes, readyNodes := 0, 0
 	var totalCapCPUm, totalCapMemKi, totalAllocCPUm, totalAllocMemKi int64
 	if items, ok := nodeList["items"].([]any); ok {
@@ -509,59 +602,23 @@ func (h *k8sMgmtHandler) overview(req *restful.Request, resp *restful.Response) 
 	}
 
 	// --- namespaces ---
-	nsList := fetch("/api/v1/namespaces")
 	nsCount := 0
 	if items, ok := nsList["items"].([]any); ok {
 		nsCount = len(items)
 	}
 
-	// --- pods ---
-	podList := fetch("/api/v1/pods")
-	podTotal, podRunning, podPending, podFailed, podSucceeded, podUnknown := 0, 0, 0, 0, 0, 0
-	if items, ok := podList["items"].([]any); ok {
-		podTotal = len(items)
-		for _, item := range items {
-			p, _ := item.(map[string]any)
-			if status, _ := p["status"].(map[string]any); status != nil {
-				switch fmt.Sprintf("%v", status["phase"]) {
-				case "Running":
-					podRunning++
-				case "Pending":
-					podPending++
-				case "Failed":
-					podFailed++
-				case "Succeeded":
-					podSucceeded++
-				default:
-					podUnknown++
-				}
-			}
-		}
-	}
+	// --- pods: use count from metadata (no full data pull) ---
+	podTotal := countViaListMeta(podCountData)
+	// Per-phase breakdown not available from limit=1; set all to 0.
+	// Frontend can fetch detailed pod list on demand.
+	podRunning, podPending, podFailed, podSucceeded, podUnknown := 0, 0, 0, 0, 0
 
-	// --- deployments ---
-	deployList := fetch("/apis/apps/v1/deployments")
-	deployCount := 0
-	if items, ok := deployList["items"].([]any); ok {
-		deployCount = len(items)
-	}
-
-	// --- daemonsets ---
-	dsList := fetch("/apis/apps/v1/daemonsets")
-	dsCount := 0
-	if items, ok := dsList["items"].([]any); ok {
-		dsCount = len(items)
-	}
-
-	// --- statefulsets ---
-	ssList := fetch("/apis/apps/v1/statefulsets")
-	ssCount := 0
-	if items, ok := ssList["items"].([]any); ok {
-		ssCount = len(items)
-	}
+	// --- workloads: use count from metadata ---
+	deployCount := countViaListMeta(deployCountData)
+	dsCount := countViaListMeta(dsCountData)
+	ssCount := countViaListMeta(ssCountData)
 
 	// --- metrics (usage from metrics-server) ---
-	metricsList := fetch("/apis/metrics.k8s.io/v1beta1/nodes")
 	var totalUsageCPUm, totalUsageMemKi int64
 	metricsAvailable := false
 	if metricsList != nil {
@@ -595,19 +652,57 @@ func (h *k8sMgmtHandler) overview(req *restful.Request, resp *restful.Response) 
 		"deployment_count":  deployCount,
 		"daemonset_count":   dsCount,
 		"statefulset_count": ssCount,
-		// resource
-		"cap_cpu_m":        totalCapCPUm,
-		"cap_mem_ki":       totalCapMemKi,
-		"alloc_cpu_m":      totalAllocCPUm,
-		"alloc_mem_ki":     totalAllocMemKi,
-		"usage_cpu_m":      totalUsageCPUm,
-		"usage_mem_ki":     totalUsageMemKi,
-		"cpu_usage_rate":   cpuUsageRate,
-		"mem_usage_rate":   memUsageRate,
-		"cpu_request_rate": cpuRequestRate,
-		"mem_request_rate": memRequestRate,
+		"cap_cpu_m":         totalCapCPUm,
+		"cap_mem_ki":        totalCapMemKi,
+		"alloc_cpu_m":       totalAllocCPUm,
+		"alloc_mem_ki":      totalAllocMemKi,
+		"usage_cpu_m":       totalUsageCPUm,
+		"usage_mem_ki":      totalUsageMemKi,
+		"cpu_usage_rate":    cpuUsageRate,
+		"mem_usage_rate":    memUsageRate,
+		"cpu_request_rate":  cpuRequestRate,
+		"mem_request_rate":  memRequestRate,
 		"metrics_available": metricsAvailable,
 	})
+}
+
+
+// parseSearchParams extracts common search/pagination params from the request.
+func parseSearchParams(req *restful.Request) k8scache.SearchParams {
+	return k8scache.SearchParams{
+		Search:    req.QueryParameter("search"),
+		Namespace: req.QueryParameter("namespace"),
+		Page:      intParam(req, "page", 1),
+		PageSize:  intParam(req, "pageSize", 20),
+		Phase:     req.QueryParameter("phase"),
+		NodeName:  req.QueryParameter("nodeName"),
+		Ready:     req.QueryParameter("ready"),
+	}
+}
+
+func intParam(req *restful.Request, key string, def int) int {
+	v := req.QueryParameter(key)
+	if v == "" {
+		return def
+	}
+	n, err := strconv.Atoi(v)
+	if err != nil {
+		return def
+	}
+	return n
+}
+
+// cacheResultOrProxy writes cache result if available, otherwise falls back to proxy.
+func (h *k8sMgmtHandler) cacheResultOrProxy(
+	req *restful.Request, resp *restful.Response,
+	dsID string, result k8scache.PaginateResult, err error, fallback func(),
+) {
+	if err != nil {
+		// Cache not available, fall back to proxy
+		fallback()
+		return
+	}
+	httputil.Success(resp, result)
 }
 
 func (h *k8sMgmtHandler) listNamespaces(req *restful.Request, resp *restful.Response) {
@@ -615,21 +710,31 @@ func (h *k8sMgmtHandler) listNamespaces(req *restful.Request, resp *restful.Resp
 }
 
 func (h *k8sMgmtHandler) listPods(req *restful.Request, resp *restful.Response) {
-	ns := req.QueryParameter("namespace")
-	path := "/api/v1/pods"
-	if ns != "" {
-		path = "/api/v1/namespaces/" + ns + "/pods"
-	}
-	h.proxyK8s(req, resp, path)
+	dsID := req.QueryParameter("ds")
+	params := parseSearchParams(req)
+	result, err := h.cacheMgr.SearchPods(dsID, params)
+	h.cacheResultOrProxy(req, resp, dsID, result, err, func() {
+		ns := req.QueryParameter("namespace")
+		path := "/api/v1/pods"
+		if ns != "" {
+			path = "/api/v1/namespaces/" + ns + "/pods"
+		}
+		h.proxyK8s(req, resp, path)
+	})
 }
 
 func (h *k8sMgmtHandler) listServices(req *restful.Request, resp *restful.Response) {
-	ns := req.QueryParameter("namespace")
-	path := "/api/v1/services"
-	if ns != "" {
-		path = "/api/v1/namespaces/" + ns + "/services"
-	}
-	h.proxyK8s(req, resp, path)
+	dsID := req.QueryParameter("ds")
+	params := parseSearchParams(req)
+	result, err := h.cacheMgr.SearchGeneric(dsID, k8scache.ResServices, params)
+	h.cacheResultOrProxy(req, resp, dsID, result, err, func() {
+		ns := req.QueryParameter("namespace")
+		path := "/api/v1/services"
+		if ns != "" {
+			path = "/api/v1/namespaces/" + ns + "/services"
+		}
+		h.proxyK8s(req, resp, path)
+	})
 }
 
 func (h *k8sMgmtHandler) listIngresses(req *restful.Request, resp *restful.Response) {
@@ -693,16 +798,26 @@ func (h *k8sMgmtHandler) listIngresses(req *restful.Request, resp *restful.Respo
 }
 
 func (h *k8sMgmtHandler) listPVCs(req *restful.Request, resp *restful.Response) {
-	ns := req.QueryParameter("namespace")
-	path := "/api/v1/persistentvolumeclaims"
-	if ns != "" {
-		path = "/api/v1/namespaces/" + ns + "/persistentvolumeclaims"
-	}
-	h.proxyK8s(req, resp, path)
+	dsID := req.QueryParameter("ds")
+	params := parseSearchParams(req)
+	result, err := h.cacheMgr.SearchGeneric(dsID, k8scache.ResPVCs, params)
+	h.cacheResultOrProxy(req, resp, dsID, result, err, func() {
+		ns := req.QueryParameter("namespace")
+		path := "/api/v1/persistentvolumeclaims"
+		if ns != "" {
+			path = "/api/v1/namespaces/" + ns + "/persistentvolumeclaims"
+		}
+		h.proxyK8s(req, resp, path)
+	})
 }
 
 func (h *k8sMgmtHandler) listNodes(req *restful.Request, resp *restful.Response) {
-	h.proxyK8s(req, resp, "/api/v1/nodes")
+	dsID := req.QueryParameter("ds")
+	params := parseSearchParams(req)
+	result, err := h.cacheMgr.SearchNodes(dsID, params)
+	h.cacheResultOrProxy(req, resp, dsID, result, err, func() {
+		h.proxyK8s(req, resp, "/api/v1/nodes")
+	})
 }
 
 // clusterSummary returns a lightweight summary for one cluster:
@@ -894,25 +1009,41 @@ func (h *k8sMgmtHandler) clusterDetail(req *restful.Request, resp *restful.Respo
 	}
 
 	ctx := req.Request.Context()
-	fetch := func(path string) map[string]any {
+	fetch := func(path string) (map[string]any, error) {
 		u := baseURL + path
 		r, e := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
-		if e != nil { return nil }
+		if e != nil { return nil, e }
 		if token != "" { r.Header.Set("Authorization", "Bearer "+token) }
 		r.Header.Set("Accept", "application/json")
 		res, e := client.Do(r)
-		if e != nil { return nil }
+		if e != nil { return nil, e }
 		defer func() { _ = res.Body.Close() }()
 		body, _ := io.ReadAll(io.LimitReader(res.Body, 32*1024*1024))
 		out := map[string]any{}
-		_ = json.Unmarshal(body, &out)
-		return out
+		if e := json.Unmarshal(body, &out); e != nil { return nil, e }
+		return out, nil
 	}
 
-	nodeList   := fetch("/api/v1/nodes")
-	// 只查 Running/Pending pod，减少数据量；用 fieldSelector 过滤已终止的 pod
-	podList    := fetch("/api/v1/pods?fieldSelector=status.phase!=Succeeded,status.phase!=Failed")
-	metrics    := fetch("/apis/metrics.k8s.io/v1beta1/nodes")
+	// 并发拉取 nodes, pods, metrics
+	g, _ := errgroup.WithContext(ctx)
+	var nodeList, podList, metricsMap map[string]any
+
+	g.Go(func() error { var e error; nodeList, e = fetch("/api/v1/nodes?limit=500"); return e })
+	g.Go(func() error {
+		var e error
+		podList, e = fetch("/api/v1/pods?fieldSelector=status.phase!=Succeeded,status.phase!=Failed&limit=500")
+		return e
+	})
+	g.Go(func() error {
+		var e error
+		metricsMap, e = fetch("/apis/metrics.k8s.io/v1beta1/nodes")
+		_ = e
+		return nil
+	})
+	if err := g.Wait(); err != nil {
+		httputil.InternalError(resp, "Kubernetes API 请求失败: "+err.Error())
+		return
+	}
 
 	// --- nodes ---
 	totalNodes, readyNodes := 0, 0
@@ -943,7 +1074,7 @@ func (h *k8sMgmtHandler) clusterDetail(req *restful.Request, resp *restful.Respo
 		}
 	}
 
-	if items, ok := metrics["items"].([]any); ok {
+	if items, ok := metricsMap["items"].([]any); ok {
 		metricsAvail = true
 		for _, item := range items {
 			m, _ := item.(map[string]any)
@@ -1115,12 +1246,17 @@ func nsName(req *restful.Request) (ns, name string, ok bool) {
 // ── Deployments ────────────────────────────────────────────────────────────────
 
 func (h *k8sMgmtHandler) listDeployments(req *restful.Request, resp *restful.Response) {
-	ns := req.QueryParameter("namespace")
-	path := "/apis/apps/v1/deployments"
-	if ns != "" {
-		path = "/apis/apps/v1/namespaces/" + ns + "/deployments"
-	}
-	h.proxyK8s(req, resp, path)
+	dsID := req.QueryParameter("ds")
+	params := parseSearchParams(req)
+	result, err := h.cacheMgr.SearchGeneric(dsID, k8scache.ResDeployments, params)
+	h.cacheResultOrProxy(req, resp, dsID, result, err, func() {
+		ns := req.QueryParameter("namespace")
+		path := "/apis/apps/v1/deployments"
+		if ns != "" {
+			path = "/apis/apps/v1/namespaces/" + ns + "/deployments"
+		}
+		h.proxyK8s(req, resp, path)
+	})
 }
 
 func (h *k8sMgmtHandler) getDeployment(req *restful.Request, resp *restful.Response) {
@@ -1202,12 +1338,17 @@ func (h *k8sMgmtHandler) deleteDeployment(req *restful.Request, resp *restful.Re
 // ── DaemonSets ─────────────────────────────────────────────────────────────────
 
 func (h *k8sMgmtHandler) listDaemonSets(req *restful.Request, resp *restful.Response) {
-	ns := req.QueryParameter("namespace")
-	path := "/apis/apps/v1/daemonsets"
-	if ns != "" {
-		path = "/apis/apps/v1/namespaces/" + ns + "/daemonsets"
-	}
-	h.proxyK8s(req, resp, path)
+	dsID := req.QueryParameter("ds")
+	params := parseSearchParams(req)
+	result, err := h.cacheMgr.SearchGeneric(dsID, k8scache.ResDaemonSets, params)
+	h.cacheResultOrProxy(req, resp, dsID, result, err, func() {
+		ns := req.QueryParameter("namespace")
+		path := "/apis/apps/v1/daemonsets"
+		if ns != "" {
+			path = "/apis/apps/v1/namespaces/" + ns + "/daemonsets"
+		}
+		h.proxyK8s(req, resp, path)
+	})
 }
 
 func (h *k8sMgmtHandler) getDaemonSet(req *restful.Request, resp *restful.Response) {
@@ -1554,8 +1695,14 @@ func (h *k8sMgmtHandler) deleteService(req *restful.Request, resp *restful.Respo
 
 // ── Ingresses write ────────────────────────────────────────────────────────────
 
-// ingressAPIGroup 探测集群支持的 Ingress API group，依次尝试 v1 → v1beta1 → extensions/v1beta1
-func (h *k8sMgmtHandler) ingressAPIGroup(ctx context.Context, client *http.Client, baseURL, token, ns, name string) string {
+// ingressAPIGroup 探测集群支持的 Ingress API group（带缓存）。
+// 结果按 dsID 缓存到 apiGroupCache，避免每次请求探测。
+func (h *k8sMgmtHandler) ingressAPIGroup(ctx context.Context, client *http.Client, baseURL, token, dsID, ns, name string) string {
+	cacheKey := dsID + ":ingress"
+	if cached, ok := h.apiGroupCache.Load(cacheKey); ok {
+		return cached.(string)
+	}
+
 	groups := []string{"networking.k8s.io/v1", "networking.k8s.io/v1beta1", "extensions/v1beta1"}
 	for _, g := range groups {
 		path := "/apis/" + g + "/namespaces/" + ns + "/ingresses/" + name
@@ -1566,15 +1713,17 @@ func (h *k8sMgmtHandler) ingressAPIGroup(ctx context.Context, client *http.Clien
 		req.Header.Set("Accept", "application/json")
 		resp, err := client.Do(req)
 		if err != nil {
-			return g // 网络错误时返回当前 group，由调用方处理
+			h.apiGroupCache.Store(cacheKey, g)
+			return g
 		}
 		_, _ = io.Copy(io.Discard, resp.Body)
 		_ = resp.Body.Close()
 		if resp.StatusCode != http.StatusNotFound {
+			h.apiGroupCache.Store(cacheKey, g)
 			return g
 		}
 	}
-	return "networking.k8s.io/v1" // 降级失败，返回默认值
+	return "networking.k8s.io/v1"
 }
 
 func (h *k8sMgmtHandler) getIngress(req *restful.Request, resp *restful.Response) {
@@ -1589,7 +1738,7 @@ func (h *k8sMgmtHandler) getIngress(req *restful.Request, resp *restful.Response
 		httputil.BadRequest(resp, err.Error())
 		return
 	}
-	g := h.ingressAPIGroup(req.Request.Context(), client, baseURL, token, ns, name)
+	g := h.ingressAPIGroup(req.Request.Context(), client, baseURL, token, dsID, ns, name)
 	h.doGet(req, resp, "/apis/"+g+"/namespaces/"+ns+"/ingresses/"+name)
 }
 
@@ -1605,7 +1754,7 @@ func (h *k8sMgmtHandler) updateIngress(req *restful.Request, resp *restful.Respo
 		httputil.BadRequest(resp, err.Error())
 		return
 	}
-	g := h.ingressAPIGroup(req.Request.Context(), client, baseURL, token, ns, name)
+	g := h.ingressAPIGroup(req.Request.Context(), client, baseURL, token, dsID, ns, name)
 	body, _ := io.ReadAll(io.LimitReader(req.Request.Body, 4*1024*1024))
 	h.doWrite(req, resp, http.MethodPut,
 		"/apis/"+g+"/namespaces/"+ns+"/ingresses/"+name,
@@ -1624,7 +1773,7 @@ func (h *k8sMgmtHandler) deleteIngress(req *restful.Request, resp *restful.Respo
 		httputil.BadRequest(resp, err.Error())
 		return
 	}
-	g := h.ingressAPIGroup(req.Request.Context(), client, baseURL, token, ns, name)
+	g := h.ingressAPIGroup(req.Request.Context(), client, baseURL, token, dsID, ns, name)
 	h.doWrite(req, resp, http.MethodDelete,
 		"/apis/"+g+"/namespaces/"+ns+"/ingresses/"+name,
 		"", nil)
@@ -1668,12 +1817,17 @@ func (h *k8sMgmtHandler) resizePVC(req *restful.Request, resp *restful.Response)
 // ── ConfigMaps ─────────────────────────────────────────────────────────────────
 
 func (h *k8sMgmtHandler) listConfigMaps(req *restful.Request, resp *restful.Response) {
-	ns := req.QueryParameter("namespace")
-	path := "/api/v1/configmaps"
-	if ns != "" {
-		path = "/api/v1/namespaces/" + ns + "/configmaps"
-	}
-	h.proxyK8s(req, resp, path)
+	dsID := req.QueryParameter("ds")
+	params := parseSearchParams(req)
+	result, err := h.cacheMgr.SearchGeneric(dsID, k8scache.ResConfigMaps, params)
+	h.cacheResultOrProxy(req, resp, dsID, result, err, func() {
+		ns := req.QueryParameter("namespace")
+		path := "/api/v1/configmaps"
+		if ns != "" {
+			path = "/api/v1/namespaces/" + ns + "/configmaps"
+		}
+		h.proxyK8s(req, resp, path)
+	})
 }
 
 func (h *k8sMgmtHandler) getConfigMap(req *restful.Request, resp *restful.Response) {
@@ -1712,21 +1866,23 @@ func (h *k8sMgmtHandler) deleteConfigMap(req *restful.Request, resp *restful.Res
 
 // hpaAPIPath tries autoscaling/v2 first, then falls back to v2beta2, then v1.
 // Returns the full path for the list endpoint.
-func (h *k8sMgmtHandler) hpaListPath(req *restful.Request, ns string) (string, bool) {
+// hpaVersion detects the best available HPA API version (带缓存).
+func (h *k8sMgmtHandler) hpaVersion(req *restful.Request) string {
 	dsID := req.QueryParameter("ds")
+	cacheKey := dsID + ":hpa"
+	if cached, ok := h.apiGroupCache.Load(cacheKey); ok {
+		return cached.(string)
+	}
+
 	client, baseURL, token, err := h.k8sClient(dsID)
 	if err != nil {
-		return "", false
+		return "v2"
 	}
 
 	candidates := []string{"v2", "v2beta2", "v1"}
 	for _, ver := range candidates {
-		p := "/apis/autoscaling/" + ver + "/horizontalpodautoscalers"
-		if ns != "" {
-			p = "/apis/autoscaling/" + ver + "/namespaces/" + ns + "/horizontalpodautoscalers"
-		}
-		u := baseURL + p + "?limit=1"
-		r, e := http.NewRequestWithContext(req.Request.Context(), http.MethodGet, u, nil)
+		p := "/apis/autoscaling/" + ver + "/horizontalpodautoscalers?limit=1"
+		r, e := http.NewRequestWithContext(req.Request.Context(), http.MethodGet, baseURL+p, nil)
 		if e != nil {
 			continue
 		}
@@ -1739,12 +1895,20 @@ func (h *k8sMgmtHandler) hpaListPath(req *restful.Request, ns string) (string, b
 		}
 		_ = res.Body.Close()
 		if res.StatusCode == 200 || res.StatusCode == 403 {
-			// 200 = works, 403 = exists but forbidden (still the right version)
-			return p, true
+			h.apiGroupCache.Store(cacheKey, ver)
+			return ver
 		}
-		// 404 = API version not available, try next
 	}
-	return "", false
+	return "v2"
+}
+
+func (h *k8sMgmtHandler) hpaListPath(req *restful.Request, ns string) (string, bool) {
+	ver := h.hpaVersion(req)
+	p := "/apis/autoscaling/" + ver + "/horizontalpodautoscalers"
+	if ns != "" {
+		p = "/apis/autoscaling/" + ver + "/namespaces/" + ns + "/horizontalpodautoscalers"
+	}
+	return p, true
 }
 
 func (h *k8sMgmtHandler) listHPAs(req *restful.Request, resp *restful.Response) {
@@ -1759,33 +1923,8 @@ func (h *k8sMgmtHandler) listHPAs(req *restful.Request, resp *restful.Response) 
 }
 
 func (h *k8sMgmtHandler) hpaVersionPath(req *restful.Request, ns, name string) string {
-	dsID := req.QueryParameter("ds")
-	client, baseURL, token, err := h.k8sClient(dsID)
-	if err != nil {
-		return "/apis/autoscaling/v2/namespaces/" + ns + "/horizontalpodautoscalers/" + name
-	}
-
-	candidates := []string{"v2", "v2beta2", "v1"}
-	for _, ver := range candidates {
-		p := "/apis/autoscaling/" + ver + "/namespaces/" + ns + "/horizontalpodautoscalers/" + name
-		u := baseURL + p
-		r, e := http.NewRequestWithContext(req.Request.Context(), http.MethodGet, u, nil)
-		if e != nil {
-			continue
-		}
-		if token != "" {
-			r.Header.Set("Authorization", "Bearer "+token)
-		}
-		res, e2 := client.Do(r)
-		if e2 != nil {
-			continue
-		}
-		_ = res.Body.Close()
-		if res.StatusCode == 200 {
-			return p
-		}
-	}
-	return "/apis/autoscaling/v2/namespaces/" + ns + "/horizontalpodautoscalers/" + name
+	ver := h.hpaVersion(req)
+	return "/apis/autoscaling/" + ver + "/namespaces/" + ns + "/horizontalpodautoscalers/" + name
 }
 
 func (h *k8sMgmtHandler) getHPA(req *restful.Request, resp *restful.Response) {
@@ -1895,12 +2034,17 @@ func (h *k8sMgmtHandler) deleteNode(req *restful.Request, resp *restful.Response
 // ── Endpoints ────────────────────────────────────────────────────────────────────
 
 func (h *k8sMgmtHandler) listEndpoints(req *restful.Request, resp *restful.Response) {
-	ns := req.QueryParameter("namespace")
-	path := "/api/v1/endpoints"
-	if ns != "" {
-		path = "/api/v1/namespaces/" + ns + "/endpoints"
-	}
-	h.proxyK8s(req, resp, path)
+	dsID := req.QueryParameter("ds")
+	params := parseSearchParams(req)
+	result, err := h.cacheMgr.SearchGeneric(dsID, k8scache.ResEndpoints, params)
+	h.cacheResultOrProxy(req, resp, dsID, result, err, func() {
+		ns := req.QueryParameter("namespace")
+		path := "/api/v1/endpoints"
+		if ns != "" {
+			path = "/api/v1/namespaces/" + ns + "/endpoints"
+		}
+		h.proxyK8s(req, resp, path)
+	})
 }
 
 func (h *k8sMgmtHandler) getEndpoint(req *restful.Request, resp *restful.Response) {
@@ -2277,6 +2421,115 @@ func (h *k8sMgmtHandler) k8sAIAnalyze(req *restful.Request, resp *restful.Respon
 	}
 }
 
+
+// ─── Rollback common types and helpers ──────────────────────────────────────────
+
+type historyEntry struct {
+	Revision          string          `json:"revision"`
+	Name              string          `json:"name"`
+	CreationTimestamp string          `json:"creationTimestamp"`
+	Replicas          int             `json:"replicas,omitempty"`
+	ReadyReplicas     int             `json:"readyReplicas,omitempty"`
+	Template          json.RawMessage `json:"template"`
+}
+
+type ownerRef struct {
+	Kind string `json:"kind"`
+	Name string `json:"kind"`
+}
+
+// getSelectorLabels fetches a workload resource and extracts spec.selector.matchLabels.
+func (h *k8sMgmtHandler) getSelectorLabels(ctx context.Context, client *http.Client, baseURL, token, path string) map[string]string {
+	data, _, _ := h.k8sWriteReq(ctx, client, baseURL, token, http.MethodGet, path, "", nil)
+	var obj struct {
+		Spec struct {
+			Selector struct {
+				MatchLabels map[string]string `json:"matchLabels"`
+			} `json:"selector"`
+		} `json:"spec"`
+	}
+	_ = json.Unmarshal(data, &obj)
+	return obj.Spec.Selector.MatchLabels
+}
+
+// labelSelectorStr converts a map to a K8s label selector string.
+func labelSelectorStr(labels map[string]string) string {
+	var parts []string
+	for k, v := range labels {
+		parts = append(parts, k+"="+v)
+	}
+	return strings.Join(parts, ",")
+}
+
+// listOwnedHistory is a generic rollback history fetcher.
+// For Deployment: childAPI = ReplicaSet path, matchBy = annotation "deployment.kubernetes.io/revision"
+// For DaemonSet:  childAPI = ControllerRevision path, matchBy = .revision field
+func (h *k8sMgmtHandler) listOwnedHistory(
+	ctx context.Context, client *http.Client, baseURL, token string,
+	ownerKind, ownerName, childAPI string,
+	matchOwner func(owners []ownerRef) bool,
+	extractRevision func(raw json.RawMessage) (string, string, json.RawMessage), // revision, name, template
+) ([]historyEntry, error) {
+	data, status, err := h.k8sWriteReq(ctx, client, baseURL, token, http.MethodGet, childAPI, "", nil)
+	if err != nil {
+		return nil, err
+	}
+	if status >= 400 {
+		return nil, fmt.Errorf("Kubernetes API error (%d): %s", status, string(data))
+	}
+
+	var list struct {
+		Items []json.RawMessage `json:"items"`
+	}
+	if err := json.Unmarshal(data, &list); err != nil {
+		return nil, err
+	}
+
+	var history []historyEntry
+	for _, raw := range list.Items {
+		rev, name, template := extractRevision(raw)
+		if rev == "" {
+			continue
+		}
+		history = append(history, historyEntry{
+			Revision: rev,
+			Name:     name,
+			Template: template,
+		})
+	}
+
+	sort.Slice(history, func(i, j int) bool {
+		ri, _ := strconv.Atoi(history[i].Revision)
+		rj, _ := strconv.Atoi(history[j].Revision)
+		return ri > rj
+	})
+	return history, nil
+}
+
+// findTemplateByRevision scans history entries and returns the template for the matching revision.
+func findTemplateByRevision(history []historyEntry, revision string) json.RawMessage {
+	for _, e := range history {
+		if e.Revision == revision {
+			return e.Template
+		}
+	}
+	return nil
+}
+
+// patchWorkloadTemplate patches a workload's pod template and writes the response.
+func (h *k8sMgmtHandler) patchWorkloadTemplate(
+	req *restful.Request, resp *restful.Response,
+	targetPath string, template json.RawMessage,
+) {
+	patch, _ := json.Marshal(map[string]any{
+		"spec": map[string]any{
+			"template": template,
+		},
+	})
+	h.doWrite(req, resp, http.MethodPatch, targetPath,
+		"application/merge-patch+json", patch)
+}
+
 // ─── Deployment rollback ────────────────────────────────────────────────────
 
 // listDeploymentHistory returns the ReplicaSets owned by the given Deployment,
@@ -2298,123 +2551,113 @@ func (h *k8sMgmtHandler) listDeploymentHistory(req *restful.Request, resp *restf
 		return
 	}
 
-	// Get Deployment selector to narrow the ReplicaSet query
-	deployBytes, _, _ := h.k8sWriteReq(req.Request.Context(), client, baseURL, token,
-		http.MethodGet, "/apis/apps/v1/namespaces/"+ns+"/deployments/"+name, "", nil)
-	var deployObj struct {
-		Spec struct {
-			Selector struct {
-				MatchLabels map[string]string `json:"matchLabels"`
-			} `json:"selector"`
-		} `json:"spec"`
-	}
-	_ = json.Unmarshal(deployBytes, &deployObj)
-	labelSelector := ""
-	for k, v := range deployObj.Spec.Selector.MatchLabels {
-		if labelSelector != "" {
-			labelSelector += ","
-		}
-		labelSelector += k + "=" + v
-	}
+	ctx := req.Request.Context()
+	labels := h.getSelectorLabels(ctx, client, baseURL, token,
+		"/apis/apps/v1/namespaces/"+ns+"/deployments/"+name)
 	rsPath := "/apis/apps/v1/namespaces/" + ns + "/replicasets"
-	if labelSelector != "" {
-		rsPath += "?labelSelector=" + url.QueryEscape(labelSelector)
+	if ls := labelSelectorStr(labels); ls != "" {
+		rsPath += "?labelSelector=" + url.QueryEscape(ls)
 	}
 
-	// List ReplicaSets (filtered by label selector)
-	rsBytes, status, err := h.k8sWriteReq(req.Request.Context(), client, baseURL, token,
-		http.MethodGet, rsPath, "", nil)
+	history, err := h.listOwnedHistory(ctx, client, baseURL, token,
+		"Deployment", name, rsPath,
+		func(owners []ownerRef) bool {
+			for _, ref := range owners {
+				if ref.Kind == "Deployment" && ref.Name == name {
+					return true
+				}
+			}
+			return false
+		},
+		func(raw json.RawMessage) (string, string, json.RawMessage) {
+			var rs struct {
+				Metadata struct {
+					Name            string            `json:"name"`
+					Annotations     map[string]string `json:"annotations"`
+					OwnerReferences []ownerRef        `json:"ownerReferences"`
+				} `json:"metadata"`
+				Spec struct {
+					Replicas int             `json:"replicas"`
+					Template json.RawMessage `json:"template"`
+				} `json:"spec"`
+				Status struct {
+					Replicas      int `json:"replicas"`
+					ReadyReplicas int `json:"readyReplicas"`
+				} `json:"status"`
+			}
+			if json.Unmarshal(raw, &rs) != nil {
+				return "", "", nil
+			}
+			owned := false
+			for _, ref := range rs.Metadata.OwnerReferences {
+				if ref.Kind == "Deployment" && ref.Name == name {
+					owned = true
+					break
+				}
+			}
+			if !owned {
+				return "", "", nil
+			}
+			return rs.Metadata.Annotations["deployment.kubernetes.io/revision"], rs.Metadata.Name, rs.Spec.Template
+		},
+	)
 	if err != nil {
 		httputil.InternalError(resp, err.Error())
 		return
 	}
-	if status >= 400 {
-		httputil.Error(resp, status, string(rsBytes))
-		return
-	}
 
-	// Parse ReplicaSet list
-	var rsList struct {
-		Items []json.RawMessage `json:"items"`
+	// Enrich with replica info
+	type rsFull struct {
+		Metadata struct {
+			Name            string            `json:"name"`
+			Annotations     map[string]string `json:"annotations"`
+			OwnerReferences []ownerRef        `json:"ownerReferences"`
+		} `json:"metadata"`
+		Spec struct {
+			Replicas int `json:"replicas"`
+		} `json:"spec"`
+		Status struct {
+			Replicas      int `json:"replicas"`
+			ReadyReplicas int `json:"readyReplicas"`
+		} `json:"status"`
 	}
-	if err := json.Unmarshal(rsBytes, &rsList); err != nil {
-		httputil.InternalError(resp, "parse replicasets: "+err.Error())
-		return
-	}
-
-	type ownerRef struct {
-		Kind string `json:"kind"`
-		Name string `json:"name"`
-	}
-	type rsMeta struct {
-		Name              string            `json:"name"`
-		CreationTimestamp string            `json:"creationTimestamp"`
-		Annotations       map[string]string `json:"annotations"`
-		OwnerReferences   []ownerRef        `json:"ownerReferences"`
-	}
-	type rsSpec struct {
-		Replicas int        `json:"replicas"`
-		Template json.RawMessage `json:"template"`
-	}
-	type rsStatus struct {
-		Replicas      int `json:"replicas"`
-		ReadyReplicas int `json:"readyReplicas"`
-	}
-	type rsItem struct {
-		Metadata rsMeta   `json:"metadata"`
-		Spec     rsSpec   `json:"spec"`
-		Status   rsStatus `json:"status"`
-	}
-
-	type historyEntry struct {
-		Revision          string          `json:"revision"`
-		Name              string          `json:"name"`
-		CreationTimestamp string          `json:"creationTimestamp"`
-		Replicas          int             `json:"replicas"`
-		ReadyReplicas     int             `json:"readyReplicas"`
-		Template          json.RawMessage `json:"template"`
-	}
-
-	var history []historyEntry
-	for _, raw := range rsList.Items {
-		var rs rsItem
-		if err := json.Unmarshal(raw, &rs); err != nil {
-			continue
-		}
-		// Filter: must be owned by this Deployment
-		ownedByDeploy := false
-		for _, ref := range rs.Metadata.OwnerReferences {
-			if ref.Kind == "Deployment" && ref.Name == name {
-				ownedByDeploy = true
-				break
-			}
-		}
-		if !ownedByDeploy {
-			continue
-		}
-		revision := rs.Metadata.Annotations["deployment.kubernetes.io/revision"]
-		history = append(history, historyEntry{
-			Revision:          revision,
-			Name:              rs.Metadata.Name,
-			CreationTimestamp: rs.Metadata.CreationTimestamp,
-			Replicas:          rs.Spec.Replicas,
-			ReadyReplicas:     rs.Status.ReadyReplicas,
-			Template:          rs.Spec.Template,
-		})
-	}
-
-	// Sort by revision number descending (newest first)
-	for i := 0; i < len(history)-1; i++ {
-		for j := i + 1; j < len(history); j++ {
-			ri, _ := strconv.Atoi(history[i].Revision)
-			rj, _ := strconv.Atoi(history[j].Revision)
-			if rj > ri {
-				history[i], history[j] = history[j], history[i]
+	// Re-fetch to get replica counts (historyEntry doesn't have them yet)
+	var enriched []historyEntry
+	data, status, _ := h.k8sWriteReq(ctx, client, baseURL, token, http.MethodGet, rsPath, "", nil)
+	if status < 400 {
+		var list struct{ Items []json.RawMessage `json:"items"` }
+		if json.Unmarshal(data, &list) == nil {
+			for _, raw := range list.Items {
+				var rs rsFull
+				if json.Unmarshal(raw, &rs) != nil {
+					continue
+				}
+				owned := false
+				for _, ref := range rs.Metadata.OwnerReferences {
+					if ref.Kind == "Deployment" && ref.Name == name {
+						owned = true
+						break
+					}
+				}
+				if !owned {
+					continue
+				}
+				rev := rs.Metadata.Annotations["deployment.kubernetes.io/revision"]
+				enriched = append(enriched, historyEntry{
+					Revision:          rev,
+					Name:              rs.Metadata.Name,
+					Replicas:          rs.Spec.Replicas,
+					ReadyReplicas:     rs.Status.ReadyReplicas,
+					CreationTimestamp: "",
+				})
 			}
 		}
 	}
-
-	httputil.Success(resp, history)
+	if enriched != nil {
+		httputil.Success(resp, enriched)
+	} else {
+		httputil.Success(resp, history)
+	}
 }
 
 // rollbackDeployment rolls back a Deployment to the specified revision by
@@ -2441,93 +2684,64 @@ func (h *k8sMgmtHandler) rollbackDeployment(req *restful.Request, resp *restful.
 		return
 	}
 
-	// Get Deployment selector to narrow the ReplicaSet query
-	deployBytes2, _, _ := h.k8sWriteReq(req.Request.Context(), client, baseURL, token,
-		http.MethodGet, "/apis/apps/v1/namespaces/"+ns+"/deployments/"+name, "", nil)
-	var deployObj2 struct {
-		Spec struct {
-			Selector struct {
-				MatchLabels map[string]string `json:"matchLabels"`
-			} `json:"selector"`
-		} `json:"spec"`
-	}
-	_ = json.Unmarshal(deployBytes2, &deployObj2)
-	labelSel2 := ""
-	for k, v := range deployObj2.Spec.Selector.MatchLabels {
-		if labelSel2 != "" {
-			labelSel2 += ","
-		}
-		labelSel2 += k + "=" + v
-	}
-	rsPath2 := "/apis/apps/v1/namespaces/" + ns + "/replicasets"
-	if labelSel2 != "" {
-		rsPath2 += "?labelSelector=" + url.QueryEscape(labelSel2)
+	ctx := req.Request.Context()
+	labels := h.getSelectorLabels(ctx, client, baseURL, token,
+		"/apis/apps/v1/namespaces/"+ns+"/deployments/"+name)
+	rsPath := "/apis/apps/v1/namespaces/" + ns + "/replicasets"
+	if ls := labelSelectorStr(labels); ls != "" {
+		rsPath += "?labelSelector=" + url.QueryEscape(ls)
 	}
 
-	// Fetch ReplicaSet list to find the target template
-	rsBytes, status, err := h.k8sWriteReq(req.Request.Context(), client, baseURL, token,
-		http.MethodGet, rsPath2, "", nil)
+	history, err := h.listOwnedHistory(ctx, client, baseURL, token,
+		"Deployment", name, rsPath,
+		func(owners []ownerRef) bool {
+			for _, ref := range owners {
+				if ref.Kind == "Deployment" && ref.Name == name {
+					return true
+				}
+			}
+			return false
+		},
+		func(raw json.RawMessage) (string, string, json.RawMessage) {
+			var rs struct {
+				Metadata struct {
+					Annotations     map[string]string `json:"annotations"`
+					OwnerReferences []ownerRef        `json:"ownerReferences"`
+				} `json:"metadata"`
+				Spec struct {
+					Template json.RawMessage `json:"template"`
+				} `json:"spec"`
+			}
+			if json.Unmarshal(raw, &rs) != nil {
+				return "", "", nil
+			}
+			owned := false
+			for _, ref := range rs.Metadata.OwnerReferences {
+				if ref.Kind == "Deployment" && ref.Name == name {
+					owned = true
+					break
+				}
+			}
+			if !owned {
+				return "", "", nil
+			}
+			return rs.Metadata.Annotations["deployment.kubernetes.io/revision"], "", rs.Spec.Template
+		},
+	)
 	if err != nil {
 		httputil.InternalError(resp, err.Error())
 		return
 	}
-	if status >= 400 {
-		httputil.Error(resp, status, string(rsBytes))
+
+	template := findTemplateByRevision(history, revision)
+	if template == nil {
+		httputil.Error(resp, http.StatusNotFound, fmt.Sprintf("revision %s not found for deployment %s", revision, name))
 		return
 	}
-
-	var rsList struct {
-		Items []struct {
-			Metadata struct {
-				Name            string            `json:"name"`
-				Annotations     map[string]string `json:"annotations"`
-				OwnerReferences []struct {
-					Kind string `json:"kind"`
-					Name string `json:"name"`
-				} `json:"ownerReferences"`
-			} `json:"metadata"`
-			Spec struct {
-				Template json.RawMessage `json:"template"`
-			} `json:"spec"`
-		} `json:"items"`
-	}
-	if err := json.Unmarshal(rsBytes, &rsList); err != nil {
-		httputil.InternalError(resp, "parse replicasets: "+err.Error())
-		return
-	}
-
-	var targetTemplate json.RawMessage
-	for _, rs := range rsList.Items {
-		ownedByDeploy := false
-		for _, ref := range rs.Metadata.OwnerReferences {
-			if ref.Kind == "Deployment" && ref.Name == name {
-				ownedByDeploy = true
-				break
-			}
-		}
-		if !ownedByDeploy {
-			continue
-		}
-		if rs.Metadata.Annotations["deployment.kubernetes.io/revision"] == revision {
-			targetTemplate = rs.Spec.Template
-			break
-		}
-	}
-	if targetTemplate == nil {
-	httputil.Error(resp, http.StatusNotFound, fmt.Sprintf("revision %s not found for deployment %s", revision, name))
-		return
-	}
-
-	// Patch the Deployment with the target template
-	patch, _ := json.Marshal(map[string]any{
-		"spec": map[string]any{
-			"template": json.RawMessage(targetTemplate),
-		},
-	})
-	h.doWrite(req, resp, http.MethodPatch,
-		"/apis/apps/v1/namespaces/"+ns+"/deployments/"+name,
-		"application/merge-patch+json", patch)
+	h.patchWorkloadTemplate(req, resp,
+		"/apis/apps/v1/namespaces/"+ns+"/deployments/"+name, template)
 }
+
 // ─── DaemonSet rollback ───────────────────────────────────────────────────────
 
 // listDaemonSetHistory returns ControllerRevisions owned by the given DaemonSet,
@@ -2549,102 +2763,59 @@ func (h *k8sMgmtHandler) listDaemonSetHistory(req *restful.Request, resp *restfu
 		return
 	}
 
-	// Get DaemonSet selector labels
-	dsBytes, _, _ := h.k8sWriteReq(req.Request.Context(), client, baseURL, token,
-		http.MethodGet, "/apis/apps/v1/namespaces/"+ns+"/daemonsets/"+name, "", nil)
-	var dsObj struct {
-		Spec struct {
-			Selector struct {
-				MatchLabels map[string]string `json:"matchLabels"`
-			} `json:"selector"`
-		} `json:"spec"`
-	}
-	_ = json.Unmarshal(dsBytes, &dsObj)
-	labelSel := ""
-	for k, v := range dsObj.Spec.Selector.MatchLabels {
-		if labelSel != "" {
-			labelSel += ","
-		}
-		labelSel += k + "=" + v
-	}
+	ctx := req.Request.Context()
+	labels := h.getSelectorLabels(ctx, client, baseURL, token,
+		"/apis/apps/v1/namespaces/"+ns+"/daemonsets/"+name)
 	crPath := "/apis/apps/v1/namespaces/" + ns + "/controllerrevisions"
-	if labelSel != "" {
-		crPath += "?labelSelector=" + url.QueryEscape(labelSel)
+	if ls := labelSelectorStr(labels); ls != "" {
+		crPath += "?labelSelector=" + url.QueryEscape(ls)
 	}
 
-	crBytes, status, err := h.k8sWriteReq(req.Request.Context(), client, baseURL, token,
-		http.MethodGet, crPath, "", nil)
+	history, err := h.listOwnedHistory(ctx, client, baseURL, token,
+		"DaemonSet", name, crPath,
+		func(owners []ownerRef) bool {
+			for _, ref := range owners {
+				if ref.Kind == "DaemonSet" && ref.Name == name {
+					return true
+				}
+			}
+			return false
+		},
+		func(raw json.RawMessage) (string, string, json.RawMessage) {
+			var cr struct {
+				Metadata struct {
+					Name              string     `json:"name"`
+					CreationTimestamp string     `json:"creationTimestamp"`
+					OwnerReferences   []ownerRef `json:"ownerReferences"`
+				} `json:"metadata"`
+				Revision int64           `json:"revision"`
+				Data     json.RawMessage `json:"data"`
+			}
+			if json.Unmarshal(raw, &cr) != nil {
+				return "", "", nil
+			}
+			owned := false
+			for _, ref := range cr.Metadata.OwnerReferences {
+				if ref.Kind == "DaemonSet" && ref.Name == name {
+					owned = true
+					break
+				}
+			}
+			if !owned {
+				return "", "", nil
+			}
+			var crData struct {
+				Spec struct {
+					Template json.RawMessage `json:"template"`
+				} `json:"spec"`
+			}
+			_ = json.Unmarshal(cr.Data, &crData)
+			return strconv.FormatInt(cr.Revision, 10), cr.Metadata.Name, crData.Spec.Template
+		},
+	)
 	if err != nil {
 		httputil.InternalError(resp, err.Error())
 		return
-	}
-	if status >= 400 {
-		httputil.Error(resp, status, string(crBytes))
-		return
-	}
-
-	var crList struct {
-		Items []struct {
-			Metadata struct {
-				Name              string            `json:"name"`
-				CreationTimestamp string            `json:"creationTimestamp"`
-				OwnerReferences   []struct {
-					Kind string `json:"kind"`
-					Name string `json:"name"`
-				} `json:"ownerReferences"`
-			} `json:"metadata"`
-			Revision int64           `json:"revision"`
-			Data     json.RawMessage `json:"data"`
-		} `json:"items"`
-	}
-	if err := json.Unmarshal(crBytes, &crList); err != nil {
-		httputil.InternalError(resp, "parse controllerrevisions: "+err.Error())
-		return
-	}
-
-	type historyEntry struct {
-		Revision          string          `json:"revision"`
-		Name              string          `json:"name"`
-		CreationTimestamp string          `json:"creationTimestamp"`
-		Template          json.RawMessage `json:"template"`
-	}
-
-	var history []historyEntry
-	for _, cr := range crList.Items {
-		ownedByDs := false
-		for _, ref := range cr.Metadata.OwnerReferences {
-			if ref.Kind == "DaemonSet" && ref.Name == name {
-				ownedByDs = true
-				break
-			}
-		}
-		if !ownedByDs {
-			continue
-		}
-		// Extract spec.template from ControllerRevision data
-		var crData struct {
-			Spec struct {
-				Template json.RawMessage `json:"template"`
-			} `json:"spec"`
-		}
-		_ = json.Unmarshal(cr.Data, &crData)
-		history = append(history, historyEntry{
-			Revision:          strconv.FormatInt(cr.Revision, 10),
-			Name:              cr.Metadata.Name,
-			CreationTimestamp: cr.Metadata.CreationTimestamp,
-			Template:          crData.Spec.Template,
-		})
-	}
-
-	// Sort descending
-	for i := 0; i < len(history)-1; i++ {
-		for j := i + 1; j < len(history); j++ {
-			ri, _ := strconv.Atoi(history[i].Revision)
-			rj, _ := strconv.Atoi(history[j].Revision)
-			if rj > ri {
-				history[i], history[j] = history[j], history[i]
-			}
-		}
 	}
 	httputil.Success(resp, history)
 }
@@ -2673,102 +2844,67 @@ func (h *k8sMgmtHandler) rollbackDaemonSet(req *restful.Request, resp *restful.R
 		return
 	}
 
-	// Get DaemonSet selector labels
-	dsBytes, _, _ := h.k8sWriteReq(req.Request.Context(), client, baseURL, token,
-		http.MethodGet, "/apis/apps/v1/namespaces/"+ns+"/daemonsets/"+name, "", nil)
-	var dsObj struct {
-		Spec struct {
-			Selector struct {
-				MatchLabels map[string]string `json:"matchLabels"`
-			} `json:"selector"`
-		} `json:"spec"`
-	}
-	_ = json.Unmarshal(dsBytes, &dsObj)
-	labelSel := ""
-	for k, v := range dsObj.Spec.Selector.MatchLabels {
-		if labelSel != "" {
-			labelSel += ","
-		}
-		labelSel += k + "=" + v
-	}
+	ctx := req.Request.Context()
+	labels := h.getSelectorLabels(ctx, client, baseURL, token,
+		"/apis/apps/v1/namespaces/"+ns+"/daemonsets/"+name)
 	crPath := "/apis/apps/v1/namespaces/" + ns + "/controllerrevisions"
-	if labelSel != "" {
-		crPath += "?labelSelector=" + url.QueryEscape(labelSel)
+	if ls := labelSelectorStr(labels); ls != "" {
+		crPath += "?labelSelector=" + url.QueryEscape(ls)
 	}
 
-	crBytes, status, err := h.k8sWriteReq(req.Request.Context(), client, baseURL, token,
-		http.MethodGet, crPath, "", nil)
-	if err != nil {
-		httputil.InternalError(resp, err.Error())
-		return
-	}
-	if status >= 400 {
-		httputil.Error(resp, status, string(crBytes))
-		return
-	}
-
-	var crList struct {
-		Items []struct {
-			Metadata struct {
-				OwnerReferences []struct {
-					Kind string `json:"kind"`
-					Name string `json:"name"`
-				} `json:"ownerReferences"`
-			} `json:"metadata"`
-			Revision int64           `json:"revision"`
-			Data     json.RawMessage `json:"data"`
-		} `json:"items"`
-	}
-	if err := json.Unmarshal(crBytes, &crList); err != nil {
-		httputil.InternalError(resp, "parse controllerrevisions: "+err.Error())
-		return
-	}
-
-	var targetTemplate json.RawMessage
-	for _, cr := range crList.Items {
-		ownedByDs := false
-		for _, ref := range cr.Metadata.OwnerReferences {
-			if ref.Kind == "DaemonSet" && ref.Name == name {
-				ownedByDs = true
-				break
+	history, err := h.listOwnedHistory(ctx, client, baseURL, token,
+		"DaemonSet", name, crPath,
+		func(owners []ownerRef) bool {
+			for _, ref := range owners {
+				if ref.Kind == "DaemonSet" && ref.Name == name {
+					return true
+				}
 			}
-		}
-		if !ownedByDs {
-			continue
-		}
-		if strconv.FormatInt(cr.Revision, 10) == revision {
+			return false
+		},
+		func(raw json.RawMessage) (string, string, json.RawMessage) {
+			var cr struct {
+				Metadata struct {
+					OwnerReferences []ownerRef `json:"ownerReferences"`
+				} `json:"metadata"`
+				Revision int64           `json:"revision"`
+				Data     json.RawMessage `json:"data"`
+			}
+			if json.Unmarshal(raw, &cr) != nil {
+				return "", "", nil
+			}
+			owned := false
+			for _, ref := range cr.Metadata.OwnerReferences {
+				if ref.Kind == "DaemonSet" && ref.Name == name {
+					owned = true
+					break
+				}
+			}
+			if !owned {
+				return "", "", nil
+			}
 			var crData struct {
 				Spec struct {
 					Template json.RawMessage `json:"template"`
 				} `json:"spec"`
 			}
 			_ = json.Unmarshal(cr.Data, &crData)
-			targetTemplate = crData.Spec.Template
-			break
-		}
-	}
-	if targetTemplate == nil {
-		httputil.Error(resp, http.StatusNotFound, fmt.Sprintf("revision %s not found for daemonset %s", revision, name))
+			return strconv.FormatInt(cr.Revision, 10), "", crData.Spec.Template
+		},
+	)
+	if err != nil {
+		httputil.InternalError(resp, err.Error())
 		return
 	}
 
-	patch, _ := json.Marshal(map[string]any{
-		"spec": map[string]any{
-			"template": json.RawMessage(targetTemplate),
-		},
-	})
-	h.doWrite(req, resp, http.MethodPatch,
-		"/apis/apps/v1/namespaces/"+ns+"/daemonsets/"+name,
-		"application/merge-patch+json", patch)
+	template := findTemplateByRevision(history, revision)
+	if template == nil {
+		httputil.Error(resp, http.StatusNotFound, fmt.Sprintf("revision %s not found for daemonset %s", revision, name))
+		return
+	}
+	h.patchWorkloadTemplate(req, resp,
+		"/apis/apps/v1/namespaces/"+ns+"/daemonsets/"+name, template)
 }
-
-// ─── Pod describe ─────────────────────────────────────────────────────────────
-
-// podDescribe returns a rich summary of a pod for restart/crash analysis:
-// - pod metadata, status, containerStatuses (incl. lastState/terminated)
-// - init containers, volumes, conditions, nodeName, podIP
-// The response is JSON (the raw pod object from K8s API) so the frontend
-// can render it in a structured way.
 func (h *k8sMgmtHandler) podDescribe(req *restful.Request, resp *restful.Response) {
 	ns, name, ok := nsName(req)
 	if !ok {

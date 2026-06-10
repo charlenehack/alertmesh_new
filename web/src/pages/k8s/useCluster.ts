@@ -2,7 +2,7 @@
  * Shared hook for K8s pages – provides the selected cluster ID
  * (persisted in sessionStorage so page refreshes keep the selection).
  */
-import { useState, useEffect, useRef } from 'react'
+import { useState, useEffect, useRef, useMemo } from 'react'
 import { useQuery } from '@tanstack/react-query'
 import { http } from '../../api/request'
 
@@ -115,4 +115,107 @@ export function fmtCreation(ts: unknown): { date: string; age: string } {
   const months = Math.floor(days / 30)
   if (months < 12) return { date, age: `${months}mo` }
   return { date, age: `${Math.floor(months / 12)}y` }
+}
+
+// ─── Server-side paginated list ─────────────────────────────────────────────
+
+export interface K8sListResponse<T> {
+  items: T[]
+  total: number
+  page: number
+  pageSize: number
+}
+
+interface UseK8sListOptions {
+  dsId: string
+  namespace?: string
+  /** Initial page size */
+  pageSize?: number
+  /** Debounce delay for search (ms). 0 = no search, direct API call */
+  searchDelay?: number
+}
+
+export function useK8sList<T = any>(
+  endpoint: string,
+  opts: UseK8sListOptions,
+) {
+  const { dsId, namespace: ns, pageSize = 20, searchDelay = 300 } = opts
+
+  const [search, setSearch] = useState('')
+  const [phase, setPhase] = useState('')
+  const [nodeName, setNodeName] = useState('')
+  const [ready, setReady] = useState('')
+  const [labelSelector, setLabelSelector] = useState('')
+  const [page, setPage] = useState(1)
+  const timerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
+
+  // Debounced search
+  const doSearch = (keyword: string) => {
+    if (timerRef.current) clearTimeout(timerRef.current)
+    if (searchDelay > 0) {
+      timerRef.current = setTimeout(() => {
+        setSearch(keyword)
+        setPage(1)
+      }, searchDelay)
+    } else {
+      setSearch(keyword)
+      setPage(1)
+    }
+  }
+
+  const params: Record<string, string | number> = {
+    ds: dsId,
+    page,
+    pageSize,
+  }
+  if (ns) params.namespace = ns
+  if (search) params.search = search
+  if (phase) params.phase = phase
+  if (nodeName) params.nodeName = nodeName
+  if (ready) params.ready = ready
+  if (labelSelector) params.labelSelector = labelSelector
+
+  const queryResult = useQuery<K8sListResponse<T>>({
+    queryKey: ['k8s-list', endpoint, dsId, ns, search, phase, nodeName, page, pageSize],
+    queryFn: () => http.get<K8sListResponse<T>>(endpoint, { params }),
+    enabled: !!dsId,
+    staleTime: 5_000,
+  })
+
+  useEffect(() => {
+    return () => { if (timerRef.current) clearTimeout(timerRef.current) }
+  }, [])
+
+  const pagination = useMemo(() => ({
+    current: page,
+    pageSize,
+    total: queryResult.data?.total ?? 0,
+    showSizeChanger: true,
+    showTotal: (t: number) => `共 ${t} 个`,
+    onChange: (p: number, ps: number) => {
+      if (ps !== pageSize) {
+        setPage(1)
+      } else {
+        setPage(p)
+      }
+    },
+    onShowSizeChange: (_: unknown, ps: number) => {
+      setPage(1)
+    },
+  }), [page, pageSize, queryResult.data?.total])
+
+  return {
+    data: queryResult.data?.items ?? [],
+    total: queryResult.data?.total ?? 0,
+    isLoading: queryResult.isLoading,
+    error: queryResult.error,
+    refetch: queryResult.refetch,
+    pagination,
+    search, doSearch,
+    phase, setPhase,
+    nodeName, setNodeName,
+    ready, setReady,
+    labelSelector, setLabelSelector,
+    page, setPage,
+  }
 }
