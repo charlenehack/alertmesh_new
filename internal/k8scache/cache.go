@@ -266,10 +266,11 @@ func matchesNamespace(objNS, filterNS string) bool {
 }
 
 type PaginateResult struct {
-	Items    []map[string]any `json:"items"`
-	Total    int              `json:"total"`
-	Page     int              `json:"page"`
-	PageSize int              `json:"pageSize"`
+	Items            []map[string]any `json:"items"`
+	Total            int              `json:"total"`
+	Page             int              `json:"page"`
+	PageSize         int              `json:"pageSize"`
+	AvailableStatuses []string        `json:"availableStatuses,omitempty"`
 }
 
 func paginate(items []map[string]any, page, pageSize int) PaginateResult {

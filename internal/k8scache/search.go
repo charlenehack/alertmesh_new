@@ -21,8 +21,20 @@ type SearchParams struct {
 
 func (cc *ClusterCache) SearchPods(params SearchParams) PaginateResult {
 	all := cc.ListPodsRaw()
-	filtered := make([]map[string]any, 0, len(all))
 
+	// 先收集所有派生状态（从全量缓存计算）
+	statusSet := make(map[string]struct{})
+	for _, pod := range all {
+		s := podDerivedStatus(pod)
+		statusSet[s] = struct{}{}
+	}
+	availableStatuses := make([]string, 0, len(statusSet))
+	for s := range statusSet {
+		availableStatuses = append(availableStatuses, s)
+	}
+
+	// 再过滤
+	filtered := make([]map[string]any, 0, len(all))
 	for _, pod := range all {
 		if !matchesNamespace(pod.Namespace, params.Namespace) {
 			continue
@@ -61,7 +73,32 @@ func (cc *ClusterCache) SearchPods(params SearchParams) PaginateResult {
 	}
 
 	sortByCreation(filtered)
-	return paginate(filtered, params.Page, params.PageSize)
+	result := paginate(filtered, params.Page, params.PageSize)
+	result.AvailableStatuses = availableStatuses
+	return result
+}
+
+// podDerivedStatus computes a human-readable status from container states.
+// Matches the frontend podDerivedStatus logic.
+func podDerivedStatus(pod *corev1.Pod) string {
+	if pod.DeletionTimestamp != nil {
+		return "Terminating"
+	}
+	phase := string(pod.Status.Phase)
+	if phase == "Failed" && pod.Status.Reason == "Evicted" {
+		return "Evicted"
+	}
+	for _, cs := range pod.Status.ContainerStatuses {
+		if cs.State.Waiting != nil && cs.State.Waiting.Reason != "" {
+			return cs.State.Waiting.Reason
+		}
+	}
+	for _, cs := range pod.Status.ContainerStatuses {
+		if cs.State.Terminated != nil && cs.State.Terminated.Reason != "" && cs.State.Terminated.Reason != "Completed" {
+			return cs.State.Terminated.Reason
+		}
+	}
+	return phase
 }
 
 func (cc *ClusterCache) SearchNodes(params SearchParams) PaginateResult {

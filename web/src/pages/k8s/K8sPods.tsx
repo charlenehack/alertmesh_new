@@ -212,10 +212,15 @@ function PodsTab({ dsId, selectorFilter = '', nsFilter = '', nodeFilterProp = ''
   }, [metricsData])
 
   const allStatuses = useMemo(() => {
+    // 优先使用服务端返回的全量状态，降级到当前页计算
+    const serverStatus = (listResult as any)?.data?.availableStatuses
+    if (serverStatus && Array.isArray(serverStatus) && serverStatus.length > 0) {
+      return serverStatus.sort()
+    }
     const set = new Set<string>();
     (pods ?? []).forEach(p => set.add(podDerivedStatus(p)))
     return Array.from(set).sort()
-  }, [pods])
+  }, [pods, listResult])
 
   const selectorPairs = selectorFilter ? selectorFilter.split(',').map(s => s.split('=')).filter(p => p.length === 2) : []
 
