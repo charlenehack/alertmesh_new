@@ -238,6 +238,26 @@ function PodsTab({ dsId, selectorFilter = '', nsFilter = '', nodeFilterProp = ''
     },
     { title: '状态', width: 130, render: (_: unknown, p: PodItem) => podPhaseTag(podDerivedStatus(p)) },
     {
+      title: '健康检查', width: 100,
+      render: (_: unknown, p: PodItem) => {
+        const probes = (p.spec?.containers ?? []).map(c => {
+          const items: string[] = []
+          if (c.livenessProbe) items.push('L')
+          if (c.readinessProbe) items.push('R')
+          if (c.startupProbe) items.push('S')
+          return items.length > 0 ? `${c.name}: ${items.join('/')}` : null
+        }).filter(Boolean)
+        if (probes.length === 0) return <span style={{ fontSize: 11, color: c.textHint }}>—</span>
+        return (
+          <Tooltip title={probes.join(' | ')}>
+            <span style={{ fontSize: 11, fontFamily: 'monospace', color: c.textSecondary, cursor: 'help' }}>
+              {probes.join(', ')}
+            </span>
+          </Tooltip>
+        )
+      },
+    },
+    {
       title: '重启次数', width: 90,
       render: (_: unknown, p: PodItem) => {
         const r = (p.status?.containerStatuses ?? []).reduce((a, c) => a + c.restartCount, 0)

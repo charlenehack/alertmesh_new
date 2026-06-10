@@ -5,8 +5,8 @@
  */
 import { useState, useMemo } from 'react'
 import { useQuery } from '@tanstack/react-query'
-import { Table, Tag, Space, Alert, Button, Input, Select, Switch, InputNumber, Badge } from 'antd'
-import { ReloadOutlined, WarningOutlined } from '@ant-design/icons'
+import { Table, Tag, Space, Alert, Button, Input, Select, Switch, InputNumber, Badge, Tooltip, Popover } from 'antd'
+import { ReloadOutlined, WarningOutlined, UnorderedListOutlined } from '@ant-design/icons'
 import { PageHeader } from '../../components/PageHeader'
 import { SurfaceCard } from '../../components/SurfaceCard'
 import { useTheme } from '../../hooks/useTheme'
@@ -50,7 +50,8 @@ export default function K8sEvents() {
 
   const fmtTime = (t?: string) => t ? new Date(t).toLocaleString('zh-CN', { hour12: false }) : '—'
 
-  const events = useMemo(() => {
+  // 去重分组：按 reason+kind+name+namespace 合并相同事件
+  const dedupedEvents = useMemo(() => {
     let items = data?.items ?? []
     if (search) {
       const q = search.toLowerCase()
@@ -61,10 +62,33 @@ export default function K8sEvents() {
         (e.involvedObject?.kind ?? '').toLowerCase().includes(q)
       )
     }
-    return items.sort((a, b) =>
-      new Date(b.lastTimestamp ?? b.metadata?.creationTimestamp ?? 0).getTime() -
-      new Date(a.lastTimestamp ?? a.metadata?.creationTimestamp ?? 0).getTime()
-    )
+
+    // 去重 key
+    const keyOf = (e: K8sEvent) =>
+      `${e.involvedObject?.kind ?? ''}/${e.involvedObject?.name ?? ''}/${e.reason ?? ''}/${e.metadata?.namespace ?? e.involvedObject?.namespace ?? ''}`
+
+    const groups = new Map<string, K8sEvent[]>()
+    for (const e of items) {
+      const key = keyOf(e)
+      const list = groups.get(key) ?? []
+      list.push(e)
+      groups.set(key, list)
+    }
+
+    // 每组取 latest 事件作为代表
+    return Array.from(groups.values())
+      .map(group => {
+        const latest = group.reduce((a, b) =>
+          new Date(b.lastTimestamp ?? b.metadata?.creationTimestamp ?? 0).getTime() >
+          new Date(a.lastTimestamp ?? a.metadata?.creationTimestamp ?? 0).getTime()
+            ? b : a
+        )
+        return { ...latest, _dedupCount: group.reduce((sum, e) => sum + (e.count ?? 1), 0) }
+      })
+      .sort((a, b) =>
+        new Date(b.lastTimestamp ?? b.metadata?.creationTimestamp ?? 0).getTime() -
+        new Date(a.lastTimestamp ?? a.metadata?.creationTimestamp ?? 0).getTime()
+      )
   }, [data, search])
 
   const warningCount = (data?.items ?? []).filter(e => e.type === 'Warning').length
@@ -94,13 +118,25 @@ export default function K8sEvents() {
     },
     {
       title: '原因', dataIndex: 'reason', width: 160,
-      render: (v: string) => <span style={{ fontSize: 12, fontFamily: 'monospace' }}>{v}</span>,
+      render: (v: string, e: K8sEvent) => (
+        <span style={{ fontSize: 12, fontFamily: 'monospace' }}>{v}</span>
+      ),
     },
     {
-      title: '次数', dataIndex: 'count', width: 60,
-      render: (v: number) => (
-        <span style={{ fontSize: 12, color: v > 5 ? c.danger : v > 1 ? c.warning : c.textSecondary }}>{v ?? 1}</span>
-      ),
+      title: '次数', width: 60,
+      render: (_: unknown, e: K8sEvent) => {
+        const count = (e as any)._dedupCount ?? (e.count ?? 1)
+        const color = count > 10 ? c.danger : count > 5 ? c.warning : c.textSecondary
+        return (
+          <span style={{ fontSize: 12, fontFamily: 'monospace', color }}>
+            {count > 1 ? (
+              <Tooltip title="去重后合并次数">{count}</Tooltip>
+            ) : (
+              count
+            )}
+          </span>
+        )
+      },
     },
     {
       title: '消息',
@@ -167,7 +203,7 @@ export default function K8sEvents() {
         {!dsId && <Alert type="info" message="请先从上方选择一个集群" />}
         {dsId && (
           <Table
-            dataSource={events}
+            dataSource={dedupedEvents}
             columns={columns}
             rowKey={e => e.metadata?.name ?? Math.random().toString()}
             rowClassName={e => e.type === 'Warning' ? 'event-row-warning' : ''}

@@ -306,6 +306,11 @@ func (h *k8sMgmtHandler) registerRoutes(ws *restful.WebService) {
 	ws.Route(meta(ws.GET("/k8s/global/events").
 		To(h.globalEvents).
 		Doc("Get all events across namespaces (?ds=&namespace=&type=Warning|Normal)")))
+
+		// ── ResourceQuotas ──────────────────────────────────────────────────────
+		ws.Route(meta(ws.GET("/k8s/resourcequotas").
+			To(h.listResourceQuotas).
+			Doc("List resource quotas, optional ?namespace= filter")))
 }
 
 // ─── cluster list ──────────────────────────────────────────────────────────────
@@ -3011,4 +3016,15 @@ func (h *k8sMgmtHandler) globalEvents(req *restful.Request, resp *restful.Respon
 		return
 	}
 	httputil.Success(resp, result)
+}
+
+// ─── ResourceQuotas ───────────────────────────────────────────────────────────
+
+func (h *k8sMgmtHandler) listResourceQuotas(req *restful.Request, resp *restful.Response) {
+	ns := req.QueryParameter("namespace")
+	path := "/api/v1/resourcequotas"
+	if ns != "" {
+		path = "/api/v1/namespaces/" + ns + "/resourcequotas"
+	}
+	h.proxyK8s(req, resp, path)
 }
