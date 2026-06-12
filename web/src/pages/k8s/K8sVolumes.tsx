@@ -7,7 +7,7 @@ import { Table, Tag, Space, Alert, Typography, Input, Button, Modal, Form, Toolt
 import { ReloadOutlined, EyeOutlined, ExpandAltOutlined, UnorderedListOutlined } from '@ant-design/icons'
 import { useTheme } from '../../hooks/useTheme'
 import { http } from '../../api/request'
-import { byCreation, k8sPagination, fmtCreation, useNamespaces, useAutoRefresh, useClusters, useSelectedCluster } from './useCluster'
+import { byCreation, k8sPagination, fmtCreation, useNamespaces, useAutoRefresh, useClusters, useSelectedCluster, useK8sList } from './useCluster'
 import { PageHeader } from '../../components/PageHeader'
 import { SurfaceCard } from '../../components/SurfaceCard'
 import { ClusterSelector } from './ClusterSelector'
@@ -26,7 +26,6 @@ interface PVCItem {
   }
   status?: { phase?: string; capacity?: { storage?: unknown } }
 }
-interface PVCList { items?: PVCItem[] }
 
 // K8s Quantity 可能是字符串或对象，统一转成字符串
 function storageStr(v: unknown): string {
@@ -43,8 +42,6 @@ const phaseColor: Record<string, string> = {
 export function VolumesTab({ dsId }: { dsId: string }) {
   const { c } = useTheme()
   const qc = useQueryClient()
-  const [ns, setNs] = useState('')
-  const [search, setSearch] = useState('')
   const [resizeTarget, setResizeTarget] = useState<PVCItem | null>(null)
   const [resizeForm] = Form.useForm()
   const [viewTarget, setViewTarget] = useState<{ ns: string; name: string } | null>(null)
@@ -52,13 +49,20 @@ export function VolumesTab({ dsId }: { dsId: string }) {
   const [aiOpen, setAiOpen] = useState(false)
   const [aiContent, setAiContent] = useState('')
 
-  const { data, isLoading, error, refetch } = useQuery<PVCList>({
-    queryKey: ['k8s-pvcs', dsId, ns],
-    queryFn: () => http.get<PVCList>('/k8s/pvcs', {
-      params: { ds: dsId, ...(ns ? { namespace: ns } : {}) },
-    }),
-    enabled: !!dsId,
-    staleTime: 15_000,
+  const {
+    data: items,
+    isLoading,
+    error,
+    refetch,
+    pagination,
+    search,
+    doSearch,
+    namespace: ns,
+    setNamespace: setNs,
+  } = useK8sList<PVCItem>('/k8s/pvcs', {
+    dsId,
+    pageSize: 20,
+    searchDelay: 300,
   })
 
   const { data: namespaces = [] } = useNamespaces(dsId)
@@ -84,9 +88,7 @@ export function VolumesTab({ dsId }: { dsId: string }) {
     onError: (e: Error) => message.error(e.message),
   })
 
-  const items = (data?.items ?? []).filter(Boolean).filter((p: PVCItem) =>
-    !search || (p.metadata?.name ?? '').toLowerCase().includes(search.toLowerCase())
-  ).sort(byCreation)
+  const sortedItems = (items ?? []).filter(Boolean).sort(byCreation)
 
   const columns = [
     { title: 'PVC 名称', render: (_: unknown, p: PVCItem) => <Text style={{ fontFamily: 'monospace', fontSize: 12 }}>{p.metadata?.name}</Text> },
@@ -128,7 +130,7 @@ export function VolumesTab({ dsId }: { dsId: string }) {
           value={ns || undefined} onChange={v => setNs(v ?? '')}
           options={namespaces.map(n => ({ label: n, value: n }))} />
         <Input.Search placeholder="搜索 PVC 名称" allowClear style={{ width: 220 }}
-          onSearch={setSearch} onChange={e => !e.target.value && setSearch('')} />
+          onSearch={doSearch} onChange={e => !e.target.value && doSearch('')} />
         <Button icon={<ReloadOutlined />} onClick={() => refetch()} loading={isLoading}>刷新</Button>
         <Space size={4}>
           <Switch size="small" checked={autoRefresh.enabled} onChange={autoRefresh.setEnabled} />
@@ -140,10 +142,10 @@ export function VolumesTab({ dsId }: { dsId: string }) {
         </Space>
       </Space>
       {error && <Alert type="error" message={(error as Error).message} style={{ marginBottom: 12 }} />}
-      <Table dataSource={items} columns={columns}
+      <Table dataSource={sortedItems} columns={columns}
         rowKey={p => `${p.metadata?.namespace}/${p.metadata?.name}`}
         loading={isLoading} size="small" scroll={{ x: 'max-content' }}
-        pagination={k8sPagination} />
+        pagination={pagination} />
 
       <Modal title={`扩容 PVC — ${resizeTarget?.metadata?.name}`}
         open={!!resizeTarget} onCancel={() => setResizeTarget(null)}

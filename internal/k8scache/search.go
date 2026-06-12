@@ -9,40 +9,34 @@ import (
 )
 
 type SearchParams struct {
-	Search    string
-	Namespace string
-	Page      int
-	PageSize  int
-	Phase     string
-	NodeName  string
-	Ready     string
+	Search        string
+	Namespace     string
+	Page          int
+	PageSize      int
+	Phase         string
+	NodeName      string
+	Ready         string
 	LabelSelector string
+	ClusterIP     string
+	Hosts         string
 }
 
 func (cc *ClusterCache) SearchPods(params SearchParams) PaginateResult {
 	all := cc.ListPodsRaw()
 
-	// 先收集所有派生状态（从全量缓存计算）
+	// 第一遍过滤：除 phase 外的所有条件
+	// 同时收集可用状态（不受 phase 过滤影响，确保用户可切换状态）
+	type podEntry struct {
+		obj    map[string]any
+		status string
+	}
+	preFiltered := make([]podEntry, 0, len(all))
 	statusSet := make(map[string]struct{})
-	for _, pod := range all {
-		s := podDerivedStatus(pod)
-		statusSet[s] = struct{}{}
-	}
-	availableStatuses := make([]string, 0, len(statusSet))
-	for s := range statusSet {
-		availableStatuses = append(availableStatuses, s)
-	}
-
-	// 再过滤
-	filtered := make([]map[string]any, 0, len(all))
 	for _, pod := range all {
 		if !matchesNamespace(pod.Namespace, params.Namespace) {
 			continue
 		}
 		if !matchesSearch(pod.Name, params.Search) {
-			continue
-		}
-		if params.Phase != "" && string(pod.Status.Phase) != params.Phase {
 			continue
 		}
 		if params.NodeName != "" && !strings.Contains(
@@ -69,7 +63,23 @@ func (cc *ClusterCache) SearchPods(params SearchParams) PaginateResult {
 		if !matchesLabels(pod.Labels, params.LabelSelector) {
 			continue
 		}
-		filtered = append(filtered, toJSON(pod))
+		s := podDerivedStatus(pod)
+		statusSet[s] = struct{}{}
+		preFiltered = append(preFiltered, podEntry{obj: toJSON(pod), status: s})
+	}
+
+	availableStatuses := make([]string, 0, len(statusSet))
+	for s := range statusSet {
+		availableStatuses = append(availableStatuses, s)
+	}
+
+	// 第二遍过滤：应用 phase 过滤
+	filtered := make([]map[string]any, 0, len(preFiltered))
+	for _, entry := range preFiltered {
+		if params.Phase != "" && entry.status != params.Phase {
+			continue
+		}
+		filtered = append(filtered, entry.obj)
 	}
 
 	sortByCreation(filtered)
@@ -141,6 +151,34 @@ func (cc *ClusterCache) SearchGeneric(res ResourceType, params SearchParams) Pag
 		if !matchesSearch(name, params.Search) {
 			continue
 		}
+
+		// Services: filter by ClusterIP
+		if params.ClusterIP != "" {
+			spec, _ := m["spec"].(map[string]any)
+			clusterIP, _ := spec["clusterIP"].(string)
+			if !strings.Contains(strings.ToLower(clusterIP), strings.ToLower(params.ClusterIP)) {
+				continue
+			}
+		}
+
+		// Ingresses: filter by Hosts
+		if params.Hosts != "" {
+			spec, _ := m["spec"].(map[string]any)
+			rules, _ := spec["rules"].([]any)
+			matched := false
+			for _, r := range rules {
+				rule, _ := r.(map[string]any)
+				host, _ := rule["host"].(string)
+				if strings.Contains(strings.ToLower(host), strings.ToLower(params.Hosts)) {
+					matched = true
+					break
+				}
+			}
+			if !matched {
+				continue
+			}
+		}
+
 		filtered = append(filtered, m)
 	}
 

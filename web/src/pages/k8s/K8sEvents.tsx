@@ -6,13 +6,14 @@
 import { useState, useMemo } from 'react'
 import { useQuery } from '@tanstack/react-query'
 import { Table, Tag, Space, Alert, Button, Input, Select, Switch, InputNumber, Badge, Tooltip, Popover } from 'antd'
-import { ReloadOutlined, WarningOutlined, UnorderedListOutlined } from '@ant-design/icons'
+import { ReloadOutlined, WarningOutlined, RobotOutlined } from '@ant-design/icons'
 import { PageHeader } from '../../components/PageHeader'
 import { SurfaceCard } from '../../components/SurfaceCard'
 import { useTheme } from '../../hooks/useTheme'
 import { http } from '../../api/request'
 import { useClusters, useSelectedCluster, useNamespaces, useAutoRefresh, k8sPagination } from './useCluster'
 import { ClusterSelector } from './ClusterSelector'
+import { K8sAIDrawer } from './K8sAIDrawer'
 
 interface K8sEvent {
   metadata?: { name?: string; namespace?: string; creationTimestamp?: string }
@@ -35,6 +36,7 @@ export default function K8sEvents() {
   const [ns, setNs] = useState('')
   const [typeFilter, setTypeFilter] = useState('')
   const [search, setSearch] = useState('')
+  const [aiTarget, setAiTarget] = useState<K8sEvent | null>(null)
 
   const { data, isLoading, error, refetch } = useQuery<EventList>({
     queryKey: ['k8s-global-events', dsId, ns, typeFilter],
@@ -141,7 +143,13 @@ export default function K8sEvents() {
     {
       title: '消息',
       render: (_: unknown, e: K8sEvent) => (
-        <span style={{ fontSize: 12, wordBreak: 'break-word', whiteSpace: 'pre-wrap' }}>{e.message}</span>
+        <Space size={4}>
+          <span style={{ fontSize: 12, wordBreak: 'break-word', whiteSpace: 'pre-wrap' }}>{e.message}</span>
+          <Tooltip title="AI 分析">
+            <Button size="small" type="text" icon={<RobotOutlined />} style={{ color: '#722ed1', padding: 0, height: 16, width: 16 }}
+              onClick={() => setAiTarget(e)} />
+          </Tooltip>
+        </Space>
       ),
     },
     {
@@ -213,6 +221,15 @@ export default function K8sEvents() {
           />
         )}
       </SurfaceCard>
+      <K8sAIDrawer
+        open={!!aiTarget}
+        onClose={() => setAiTarget(null)}
+        resourceKind={aiTarget?.involvedObject?.kind ?? 'Event'}
+        namespace={aiTarget?.involvedObject?.namespace ?? aiTarget?.metadata?.namespace ?? ''}
+        name={aiTarget?.involvedObject?.name ?? ''}
+        analysisKind="events"
+        content={aiTarget ? `${aiTarget.reason ?? ''}: ${aiTarget.message ?? ''}` : ''}
+      />
     </>
   )
 }

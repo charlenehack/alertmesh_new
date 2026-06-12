@@ -12,7 +12,7 @@ import {
 } from '@ant-design/icons'
 import { useTheme } from '../../hooks/useTheme'
 import { http } from '../../api/request'
-import { byCreation, k8sPagination, fmtCreation, useNamespaces, useAutoRefresh } from './useCluster'
+import { byCreation, k8sPagination, fmtCreation, useNamespaces, useAutoRefresh, useK8sList } from './useCluster'
 import { ConfigMapEditor } from './ConfigMapEditor'
 
 const { Text } = Typography
@@ -26,22 +26,26 @@ interface CmItem {
   data?: Record<string, string>
   binaryData?: Record<string, string>
 }
-interface CmList { items?: CmItem[] }
 
 export function ConfigMapsTab({ dsId }: { dsId: string }) {
   const { c } = useTheme()
   const qc = useQueryClient()
-  const [ns, setNs] = useState('')
-  const [search, setSearch] = useState('')
   const [editTarget, setEditTarget] = useState<{ ns: string; name: string; readonly?: boolean } | null>(null)
 
-  const { data, isLoading, error, refetch } = useQuery<CmList>({
-    queryKey: ['k8s-configmaps', dsId, ns],
-    queryFn: () => http.get<CmList>('/k8s/configmaps', {
-      params: { ds: dsId, ...(ns ? { namespace: ns } : {}) },
-    }),
-    enabled: !!dsId,
-    staleTime: 15_000,
+  const {
+    data: items,
+    isLoading,
+    error,
+    refetch,
+    pagination,
+    search,
+    doSearch,
+    namespace: ns,
+    setNamespace: setNs,
+  } = useK8sList<CmItem>('/k8s/configmaps', {
+    dsId,
+    pageSize: 20,
+    searchDelay: 300,
   })
 
   const { data: namespaces = [] } = useNamespaces(dsId)
@@ -77,9 +81,7 @@ export function ConfigMapsTab({ dsId }: { dsId: string }) {
     onError: (e: Error) => message.error(e.message),
   })
 
-  const items = (data?.items ?? []).filter(cm =>
-    !search || (cm.metadata?.name ?? '').toLowerCase().includes(search.toLowerCase())
-  ).sort(byCreation)
+  const sortedItems = (items ?? []).sort(byCreation)
 
   const columns = [
     {
@@ -166,7 +168,7 @@ export function ConfigMapsTab({ dsId }: { dsId: string }) {
           options={namespaces.map(n => ({ label: n, value: n }))} />
         <Input.Search
           placeholder="搜索 ConfigMap 名称" allowClear style={{ width: 220 }}
-          onSearch={setSearch} onChange={e => !e.target.value && setSearch('')} />
+          onSearch={doSearch} onChange={e => !e.target.value && doSearch('')} />
         <Button icon={<ReloadOutlined />} onClick={() => refetch()} loading={isLoading}>刷新</Button>
         <Space size={4}>
           <Switch size="small" checked={autoRefresh.enabled} onChange={autoRefresh.setEnabled} />
@@ -179,13 +181,13 @@ export function ConfigMapsTab({ dsId }: { dsId: string }) {
       </Space>
       {error && <Alert type="error" message={(error as Error).message} style={{ marginBottom: 12 }} />}
       <Table
-        dataSource={items}
+        dataSource={sortedItems}
         columns={columns}
         rowKey={cm => `${cm.metadata?.namespace}/${cm.metadata?.name}`}
         loading={isLoading}
         size="small"
         scroll={{ x: 'max-content' }}
-        pagination={k8sPagination}
+        pagination={pagination}
       />
 
       <ConfigMapEditor

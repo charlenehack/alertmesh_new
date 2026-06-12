@@ -34,7 +34,7 @@ const { Text } = Typography
 
 // ─── types ────────────────────────────────────────────────────────────────────
 
-interface Container { name: string; image: string }
+interface Container { name: string; image: string; livenessProbe?: unknown; readinessProbe?: unknown; startupProbe?: unknown }
 interface TerminatedState { reason?: string; exitCode?: number; signal?: number; message?: string; startedAt?: string; finishedAt?: string }
 interface ContainerStatus {
   name: string; ready: boolean; restartCount: number
@@ -67,7 +67,6 @@ interface DsItem {
   }
   status?: { desiredNumberScheduled?: number; numberReady?: number }
 }
-interface DsList { items?: DsItem[] }
 
 interface HistoryEntry {
   revision: string
@@ -127,11 +126,7 @@ function useK8sGet(endpoint: string, params: Record<string, string>, enabled: bo
 function PodsTab({ dsId, selectorFilter = '', nsFilter = '', nodeFilterProp = '' }: { dsId: string; selectorFilter?: string; nsFilter?: string; nodeFilterProp?: string }) {
   const { c } = useTheme()
   const qc = useQueryClient()
-  const [ns, setNs] = useState(nsFilter)
-  const [search, setSearch] = useState('')
-  const [phaseFilter, setPhaseFilter] = useState('')
-  const [readyFilter, setReadyFilter] = useState('')
-  const [nodeFilter, setNodeFilter] = useState(nodeFilterProp)
+  const [urlParams, setUrlParams] = useSearchParams()
   const [viewTarget, setViewTarget] = useState<{ ns: string; name: string } | null>(null)
   const [logModal, setLogModal] = useState<{ ns: string; name: string; container: string; restartCount?: number } | null>(null)
   const [eventModal, setEventModal] = useState<{ ns: string; name: string } | null>(null)
@@ -149,16 +144,53 @@ function PodsTab({ dsId, selectorFilter = '', nsFilter = '', nodeFilterProp = ''
     doSearch,
     phase,
     setPhase,
+    namespace: ns,
+    setNamespace: setNs,
     nodeName: nodeNameFilter,
     setNodeName,
     ready,
     setReady,
+    raw: podsRaw,
+    page: podPage,
+    setPage,
+    labelSelector,
+    setLabelSelector,
   } = useK8sList<PodItem>('/k8s/pods', {
     dsId,
-    namespace: ns || undefined,
+    namespace: nsFilter || undefined,
+    labelSelector: selectorFilter || undefined,
+    nodeName: nodeFilterProp || undefined,
     pageSize: 20,
     searchDelay: 300,
   })
+
+  // URL 参数变化时同步到 useK8sList state（例如从 Deployments 点击"查看Pod"）
+  // 当 URL 参数被清空时也清除对应 state，确保用户手动操作后能回到全量视图
+  useEffect(() => {
+    if (nsFilter && nsFilter !== ns) setNs(nsFilter)
+  }, [nsFilter])
+  useEffect(() => {
+    if (selectorFilter) {
+      if (selectorFilter !== labelSelector) setLabelSelector(selectorFilter)
+    } else if (labelSelector) {
+      setLabelSelector('')
+    }
+  }, [selectorFilter])
+  useEffect(() => {
+    if (nodeFilterProp && nodeFilterProp !== nodeNameFilter) setNodeName(nodeFilterProp)
+  }, [nodeFilterProp])
+
+  // 用户手动操作筛选条件时，直接清除 labelSelector 并清除 URL 中的过滤参数
+  // 不再依赖 URL 变化 → prop 变化 → useEffect 链路（有时序问题）
+  const clearFiltersFromUserAction = () => {
+    if (labelSelector) setLabelSelector('')
+    const newParams = new URLSearchParams(urlParams)
+    let changed = false
+    if (newParams.has('selector')) { newParams.delete('selector'); changed = true }
+    if (newParams.has('ns')) { newParams.delete('ns'); changed = true }
+    if (newParams.has('node')) { newParams.delete('node'); changed = true }
+    if (changed) setUrlParams(newParams)
+  }
 
   const { data: namespaces = [] } = useNamespaces(dsId)
   const autoRefresh = useAutoRefresh(refetch, 0)
@@ -213,14 +245,14 @@ function PodsTab({ dsId, selectorFilter = '', nsFilter = '', nodeFilterProp = ''
 
   const allStatuses = useMemo(() => {
     // 优先使用服务端返回的全量状态，降级到当前页计算
-    const serverStatus = (listResult as any)?.data?.availableStatuses
+    const serverStatus = podsRaw?.data?.availableStatuses
     if (serverStatus && Array.isArray(serverStatus) && serverStatus.length > 0) {
       return serverStatus.sort()
     }
     const set = new Set<string>();
     (pods ?? []).forEach(p => set.add(podDerivedStatus(p)))
     return Array.from(set).sort()
-  }, [pods, listResult])
+  }, [pods, podsRaw])
 
   const selectorPairs = selectorFilter ? selectorFilter.split(',').map(s => s.split('=')).filter(p => p.length === 2) : []
 
@@ -242,26 +274,6 @@ function PodsTab({ dsId, selectorFilter = '', nsFilter = '', nodeFilterProp = ''
       },
     },
     { title: '状态', width: 130, render: (_: unknown, p: PodItem) => podPhaseTag(podDerivedStatus(p)) },
-    {
-      title: '健康检查', width: 100,
-      render: (_: unknown, p: PodItem) => {
-        const probes = (p.spec?.containers ?? []).map(c => {
-          const items: string[] = []
-          if (c.livenessProbe) items.push('L')
-          if (c.readinessProbe) items.push('R')
-          if (c.startupProbe) items.push('S')
-          return items.length > 0 ? `${c.name}: ${items.join('/')}` : null
-        }).filter(Boolean)
-        if (probes.length === 0) return <span style={{ fontSize: 11, color: c.textHint }}>—</span>
-        return (
-          <Tooltip title={probes.join(' | ')}>
-            <span style={{ fontSize: 11, fontFamily: 'monospace', color: c.textSecondary, cursor: 'help' }}>
-              {probes.join(', ')}
-            </span>
-          </Tooltip>
-        )
-      },
-    },
     {
       title: '重启次数', width: 90,
       render: (_: unknown, p: PodItem) => {
@@ -360,23 +372,23 @@ function PodsTab({ dsId, selectorFilter = '', nsFilter = '', nodeFilterProp = ''
           allowClear
           showSearch
           value={ns || undefined}
-          onChange={v => setNs(v ?? '')}
+          onChange={v => { setNs(v ?? ''); clearFiltersFromUserAction() }}
           options={namespaces.map(n => ({ label: n, value: n }))}
         />
         <Input.Search placeholder="搜索 Pod 名称" allowClear style={{ width: 200 }}
           onSearch={doSearch} onChange={e => !e.target.value && doSearch('')} />
         <Select style={{ width: 160 }} placeholder="状态" allowClear value={phase || undefined}
-          onChange={v => { setPhase(v ?? ''); setPage(1) }}
+          onChange={v => { setPhase(v ?? ''); clearFiltersFromUserAction() }}
           options={allStatuses.map(s => ({ label: s, value: s }))} />
         <Select style={{ width: 110 }} placeholder="READY" allowClear value={ready || undefined}
-          onChange={v => setReady(v ?? '')}
+          onChange={v => { setReady(v ?? ''); clearFiltersFromUserAction() }}
           options={[
             { label: '全部就绪', value: 'ready' },
             { label: '未就绪', value: 'notready' },
           ]} />
         <Input.Search placeholder="节点名" allowClear style={{ width: 200 }}
-          onSearch={setNodeName} onChange={e => !e.target.value && setNodeName('')} />
-        <Button icon={<ReloadOutlined />} onClick={() => refetch()} loading={isLoading}>刷新</Button>
+          onSearch={v => { setNodeName(v); clearFiltersFromUserAction() }} onChange={e => !e.target.value && setNodeName('')} />
+        <Button icon={<ReloadOutlined />} onClick={() => { clearFiltersFromUserAction(); refetch() }} loading={isLoading}>刷新</Button>
         <Space size={4}>
           <Switch
             size="small"
@@ -423,8 +435,7 @@ function DeploymentsTab({ dsId }: { dsId: string }) {
   const { c } = useTheme()
   const qc = useQueryClient()
   const navigate = useNavigate()
-  const [ns, setNs] = useState('')
-  const [search, setSearch] = useState('')
+  const [searchParams, setSearchParams] = useSearchParams()
   const [scaleTarget, setScaleTarget] = useState<DeployItem | null>(null)
   const [scaleForm] = Form.useForm()
   const [editTarget, setEditTarget] = useState<{ item: DeployItem; data: unknown } | null>(null)
@@ -439,10 +450,11 @@ function DeploymentsTab({ dsId }: { dsId: string }) {
     error,
     refetch,
     pagination,
+    namespace: ns,
+    setNamespace: setNs,
     doSearch,
   } = useK8sList<DeployItem>('/k8s/deployments', {
     dsId,
-    namespace: ns || undefined,
     pageSize: 20,
     searchDelay: 300,
   })
@@ -460,7 +472,7 @@ function DeploymentsTab({ dsId }: { dsId: string }) {
   // 当 detail 加载完毕，打开编辑器
   useState(() => {
     if (deployDetail && getTarget) {
-      const item = (data?.items ?? []).find(d =>
+      const item = (deploys ?? []).find(d =>
         d.metadata?.name === getTarget.name && d.metadata?.namespace === getTarget.ns
       )
       if (item) setEditTarget({ item, data: deployDetail })
@@ -536,7 +548,10 @@ function DeploymentsTab({ dsId }: { dsId: string }) {
         <Space size={4}>
           <Tooltip title="查看 Pod">
             <Button size="small" type="text" icon={<LinkOutlined />}
-              onClick={() => navigate(`/k8s/resources?ds=${dsId}&tab=pods&selector=${encodeURIComponent(Object.entries(d.spec?.selector?.matchLabels ?? {}).map(([k,v]) => `${k}=${v}`).join(','))}&ns=${d.metadata?.namespace ?? ''}`)} />
+              onClick={() => {
+                const sel = Object.entries(d.spec?.selector?.matchLabels ?? {}).map(([k,v]) => k + '=' + v).join(',')
+                setSearchParams({ tab: 'pods', ds: dsId, selector: sel, ns: d.metadata?.namespace ?? '' })
+              }} />
           </Tooltip>
           <Tooltip title="扩缩容">
             <Button size="small" type="text" icon={<ExpandAltOutlined />}
@@ -701,20 +716,26 @@ function DaemonSetsTab({ dsId }: { dsId: string }) {
   const { c } = useTheme()
   const qc = useQueryClient()
   const navigate = useNavigate()
-  const [ns, setNs] = useState('')
-  const [search, setSearch] = useState('')
+  const [searchParams, setSearchParams] = useSearchParams()
   const [getTarget, setGetTarget] = useState<{ ns: string; name: string } | null>(null)
   const [eventTarget, setEventTarget] = useState<{ ns: string; name: string } | null>(null)
   const [dsRollbackTarget, setDsRollbackTarget] = useState<{ ns: string; name: string } | null>(null)
   const [dsSelectedRevision, setDsSelectedRevision] = useState<string | null>(null)
 
-  const { data, isLoading, error, refetch } = useQuery<DsList>({
-    queryKey: ['k8s-daemonsets', dsId, ns],
-    queryFn: () => http.get<DsList>('/k8s/daemonsets', {
-      params: { ds: dsId, ...(ns ? { namespace: ns } : {}) },
-    }),
-    enabled: !!dsId,
-    staleTime: 10_000,
+  const {
+    data: items,
+    isLoading,
+    error,
+    refetch,
+    pagination,
+    search,
+    doSearch,
+    namespace: ns,
+    setNamespace: setNs,
+  } = useK8sList<DsItem>('/k8s/daemonsets', {
+    dsId,
+    pageSize: 20,
+    searchDelay: 300,
   })
 
   const { data: namespaces = [] } = useNamespaces(dsId)
@@ -767,9 +788,7 @@ function DaemonSetsTab({ dsId }: { dsId: string }) {
     onError: (e: Error) => message.error(e.message),
   })
 
-  const items = (data?.items ?? []).filter(d =>
-    !search || (d.metadata?.name ?? '').toLowerCase().includes(search.toLowerCase())
-  ).sort(byCreation)
+  const sortedItems = (items ?? []).sort(byCreation)
 
   const columns = [
     { title: 'DaemonSet 名称', render: (_: unknown, d: DsItem) => <Text style={{ fontFamily: 'monospace', fontSize: 12 }}>{d.metadata?.name}</Text> },
@@ -791,7 +810,10 @@ function DaemonSetsTab({ dsId }: { dsId: string }) {
         <Space size={4}>
           <Tooltip title="查看 Pod">
             <Button size="small" type="text" icon={<LinkOutlined />}
-              onClick={() => navigate(`/k8s/resources?ds=${dsId}&tab=pods&selector=${encodeURIComponent(Object.entries(d.spec?.selector?.matchLabels ?? {}).map(([k,v]) => `${k}=${v}`).join(','))}&ns=${d.metadata?.namespace ?? ''}`)} />
+              onClick={() => {
+                const sel = Object.entries(d.spec?.selector?.matchLabels ?? {}).map(([k,v]) => k + '=' + v).join(',')
+                setSearchParams({ tab: 'pods', ds: dsId, selector: sel, ns: d.metadata?.namespace ?? '' })
+              }} />
           </Tooltip>
           <Tooltip title="事件">
             <Button size="small" type="text" icon={<UnorderedListOutlined />}
@@ -836,7 +858,7 @@ function DaemonSetsTab({ dsId }: { dsId: string }) {
           options={namespaces.map(n => ({ label: n, value: n }))}
         />
         <Input.Search placeholder="搜索 DaemonSet 名称" allowClear style={{ width: 240 }}
-          onSearch={setSearch} onChange={e => !e.target.value && setSearch('')} />
+          onSearch={doSearch} onChange={e => !e.target.value && doSearch('')} />
         <Button icon={<ReloadOutlined />} onClick={() => refetch()} loading={isLoading}>刷新</Button>
         <Space size={4}>
           <Switch size="small" checked={autoRefresh.enabled} onChange={autoRefresh.setEnabled} />
@@ -848,10 +870,10 @@ function DaemonSetsTab({ dsId }: { dsId: string }) {
         </Space>
       </Space>
       {error && <Alert type="error" message={(error as Error).message} style={{ marginBottom: 8 }} />}
-      <Table dataSource={items} columns={columns}
+      <Table dataSource={sortedItems} columns={columns}
         rowKey={d => `${d.metadata?.namespace}/${d.metadata?.name}`}
         loading={isLoading} size="small" scroll={{ x: 'max-content' }}
-        pagination={k8sPagination} />
+        pagination={pagination} />
 
       <YamlEditor
         title={`编辑 DaemonSet: ${getTarget?.name ?? ''}`}
@@ -1141,6 +1163,7 @@ export default function K8sPods() {
         {!dsId && <Alert type="info" message="请先从上方选择一个集群" style={{ marginBottom: 12 }} />}
         {dsId && (
           <Tabs
+            destroyInactiveTabPane
             activeKey={tabFromUrl}
             onChange={key => {
               const ds = searchParams.get('ds')

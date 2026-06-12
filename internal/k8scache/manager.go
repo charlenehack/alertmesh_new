@@ -165,6 +165,18 @@ func (m *Manager) SearchGeneric(dsID string, res ResourceType, params SearchPara
 	return cache.SearchGeneric(res, params), nil
 }
 
+// PodStatusCounts returns a map of derived status → count for the given cluster.
+func (m *Manager) PodStatusCounts(dsID string) (map[string]int, error) {
+	cache := m.GetCache(dsID)
+	if cache == nil {
+		return nil, fmt.Errorf("cluster %s not cached", dsID)
+	}
+	if !cache.Ready() {
+		return nil, fmt.Errorf("cluster %s cache not ready yet", dsID)
+	}
+	return cache.PodStatusCounts(), nil
+}
+
 // Shutdown stops all cluster caches.
 func (m *Manager) Shutdown(ctx context.Context) {
 	m.mu.Lock()

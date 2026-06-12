@@ -23,25 +23,6 @@ import { ClusterSelector } from './ClusterSelector'
 
 const { Text, Title: AntTitle } = Typography
 
-// ─── Pod 派生状态 ──────────────────────────────────────────────────────────────
-interface PodItemMin {
-  metadata?: { deletionTimestamp?: string }
-  status?: { phase?: string; reason?: string; containerStatuses?: { state?: { waiting?: { reason?: string }; terminated?: { reason?: string } } }[] }
-}
-function derivePodStatus(p: PodItemMin): string {
-  if (p.metadata?.deletionTimestamp) return 'Terminating'
-  const phase = p.status?.phase ?? 'Unknown'
-  if (phase === 'Failed' && p.status?.reason === 'Evicted') return 'Evicted'
-  for (const cs of p.status?.containerStatuses ?? []) {
-    const r = cs.state?.waiting?.reason
-    if (r) return r
-  }
-  for (const cs of p.status?.containerStatuses ?? []) {
-    const r = cs.state?.terminated?.reason
-    if (r && r !== 'Completed') return r
-  }
-  return phase
-}
 const STATUS_COLORS: Record<string, string> = {
   Running: '#52c41a', Pending: '#faad14', Failed: '#ff4d4f',
   Succeeded: '#1677ff', Unknown: '#d9d9d9', Evicted: '#f5222d',
@@ -55,11 +36,6 @@ interface OverviewData {
   ready_nodes: number
   namespace_count: number
   pod_total: number
-  pod_running: number
-  pod_pending: number
-  pod_failed: number
-  pod_succeeded: number
-  pod_unknown: number
   deployment_count: number
   daemonset_count: number
   statefulset_count: number
@@ -75,6 +51,7 @@ interface OverviewData {
   cpu_request_rate: number
   mem_request_rate: number
   metrics_available: boolean
+  pod_status_distribution: Record<string, number>
 }
 
 function fmtCpu(m: number): string {
@@ -160,27 +137,15 @@ export default function K8sOverview() {
     refetchInterval: 30_000,
   })
 
-  const { data: podList } = useQuery<{ items?: PodItemMin[] }>({
-    queryKey: ['k8s-pods-overview', dsId],
-    queryFn: () => http.get('/k8s/pods', { params: { ds: dsId } }),
-    enabled: !!dsId,
-    staleTime: 30_000,
-    refetchInterval: 30_000,
-  })
-
-  // Pod 状态柱状图：从真实 pod 列表派生动态状态
+  // Pod 状态柱状图：使用后端从缓存计算的 pod_status_distribution
   const podChartData = useMemo(() => {
-    if (!podList?.items?.length) return []
-    const counts: Record<string, number> = {}
-    podList.items.forEach(p => {
-      const s = derivePodStatus(p)
-      counts[s] = (counts[s] ?? 0) + 1
-    })
-    return Object.entries(counts)
+    const dist = data?.pod_status_distribution
+    if (!dist || Object.keys(dist).length === 0) return []
+    return Object.entries(dist)
       .filter(([, c]) => c > 0)
       .sort((a, b) => b[1] - a[1])
       .map(([name, count]) => ({ name, count, fill: STATUS_COLORS[name] ?? '#8c8c8c' }))
-  }, [podList])
+  }, [data?.pod_status_distribution])
 
   const textColor = isDark ? '#d4d4d4' : '#333'
   const axisColor = isDark ? '#555' : '#ddd'
@@ -235,8 +200,8 @@ export default function K8sOverview() {
                       <div style={{ fontSize: 22, fontWeight: 700 }}>{data.pod_total}</div>
                       <div style={{ fontSize: 12, color: '#999' }}>
                         Pod 总数
-                        {data.pod_running > 0 && (
-                          <Tag color="success" style={{ marginLeft: 6, fontSize: 11 }}>{data.pod_running} Running</Tag>
+                        {(data.pod_status_distribution?.Running ?? 0) > 0 && (
+                          <Tag color="success" style={{ marginLeft: 6, fontSize: 11 }}>{data.pod_status_distribution?.Running ?? 0} Running</Tag>
                         )}
                       </div>
                     </div>

@@ -12,7 +12,7 @@ import {
 } from '@ant-design/icons'
 import { useTheme } from '../../hooks/useTheme'
 import { http } from '../../api/request'
-import { byCreation, k8sPagination, fmtCreation, useNamespaces, useAutoRefresh } from './useCluster'
+import { byCreation, k8sPagination, fmtCreation, useNamespaces, useAutoRefresh, useK8sList } from './useCluster'
 import { YamlEditor } from './YamlEditor'
 
 const { Text } = Typography
@@ -41,7 +41,6 @@ interface HpaItem {
   spec?: HpaSpec
   status?: HpaStatus
 }
-interface HpaList { items?: HpaItem[] }
 
 function hpaStatusTag(status?: HpaStatus) {
   const scaling = (status?.conditions ?? []).find(c => c.type === 'ScalingActive')
@@ -70,17 +69,22 @@ function metricDesc(spec?: HpaSpec) {
 export function HpasTab({ dsId }: { dsId: string }) {
   const { c } = useTheme()
   const qc = useQueryClient()
-  const [ns, setNs] = useState('')
-  const [search, setSearch] = useState('')
   const [editTarget, setEditTarget] = useState<{ ns: string; name: string; readonly?: boolean } | null>(null)
 
-  const { data, isLoading, error, refetch } = useQuery<HpaList>({
-    queryKey: ['k8s-hpas', dsId, ns],
-    queryFn: () => http.get<HpaList>('/k8s/hpas', {
-      params: { ds: dsId, ...(ns ? { namespace: ns } : {}) },
-    }),
-    enabled: !!dsId,
-    staleTime: 15_000,
+  const {
+    data: items,
+    isLoading,
+    error,
+    refetch,
+    pagination,
+    search,
+    doSearch,
+    namespace: ns,
+    setNamespace: setNs,
+  } = useK8sList<HpaItem>('/k8s/hpas', {
+    dsId,
+    pageSize: 20,
+    searchDelay: 300,
   })
 
   const { data: namespaces = [] } = useNamespaces(dsId)
@@ -109,9 +113,7 @@ export function HpasTab({ dsId }: { dsId: string }) {
     onError: (e: Error) => message.error(e.message),
   })
 
-  const items = (data?.items ?? []).filter(h =>
-    !search || (h.metadata?.name ?? '').toLowerCase().includes(search.toLowerCase())
-  ).sort(byCreation)
+  const sortedItems = (items ?? []).sort(byCreation)
 
   const columns = [
     { title: 'HPA 名称', render: (_: unknown, h: HpaItem) => <Text style={{ fontFamily: 'monospace', fontSize: 12 }}>{h.metadata?.name}</Text> },
@@ -168,7 +170,7 @@ export function HpasTab({ dsId }: { dsId: string }) {
           value={ns || undefined} onChange={v => setNs(v ?? '')}
           options={namespaces.map(n => ({ label: n, value: n }))} />
         <Input.Search placeholder="搜索 HPA 名称" allowClear style={{ width: 220 }}
-          onSearch={setSearch} onChange={e => !e.target.value && setSearch('')} />
+          onSearch={doSearch} onChange={e => !e.target.value && doSearch('')} />
         <Button icon={<ReloadOutlined />} onClick={() => refetch()} loading={isLoading}>刷新</Button>
         <Space size={4}>
           <Switch size="small" checked={autoRefresh.enabled} onChange={autoRefresh.setEnabled} />
@@ -180,10 +182,10 @@ export function HpasTab({ dsId }: { dsId: string }) {
         </Space>
       </Space>
       {error && <Alert type="error" message={(error as Error).message} style={{ marginBottom: 12 }} />}
-      <Table dataSource={items} columns={columns}
+      <Table dataSource={sortedItems} columns={columns}
         rowKey={h => `${h.metadata?.namespace}/${h.metadata?.name}`}
         loading={isLoading} size="small" scroll={{ x: 'max-content' }}
-        pagination={k8sPagination} />
+        pagination={pagination} />
 
       <YamlEditor
         title={`${isReadonly ? '查看' : '编辑'} HPA: ${editTarget?.name ?? ''}`}

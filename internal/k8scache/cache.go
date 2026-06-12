@@ -171,23 +171,26 @@ func (cc *ClusterCache) startInformers() {
 }
 
 func (cc *ClusterCache) startDynamicInformerWithFallback(res ResourceType, gvrs []schema.GroupVersionResource) {
-	dynFactory := dynamicinformer.NewFilteredDynamicSharedInformerFactory(cc.dynCli, 5*time.Minute, "", nil)
-
 	for _, gvr := range gvrs {
+		// 每个版本使用独立的 factory，避免 GVR 间互相干扰
+		dynFactory := dynamicinformer.NewFilteredDynamicSharedInformerFactory(cc.dynCli, 5*time.Minute, "", nil)
 		inf := dynFactory.ForResource(gvr).Informer()
 
-		// Quick probe: check if this API version exists
-		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-		defer cancel()
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		dynFactory.Start(ctx.Done()) // 启动 factory 内所有已注册的 informer
 
-		go inf.Run(cc.stopCh)
-		if cache.WaitForCacheSync(ctx.Done(), inf.HasSynced) {
+		synced := cache.WaitForCacheSync(ctx.Done(), inf.HasSynced)
+		cancel() // 立即释放 context，而非 defer
+
+		if synced {
 			cc.mu.Lock()
 			cc.stores[res] = inf.GetStore()
 			cc.mu.Unlock()
 			log.Info().Str("ds", cc.dsID).Str("resource", string(res)).Str("gvr", gvr.Group+"/"+gvr.Version).Msg("dynamic informer synced")
 			return
 		}
+		// 当前版本不可用，清理后尝试下一版本
+		log.Warn().Str("ds", cc.dsID).Str("resource", string(res)).Str("gvr", gvr.Group+"/"+gvr.Version).Msg("dynamic informer version not available, trying next")
 	}
 
 	// All versions failed
@@ -295,6 +298,16 @@ func paginate(items []map[string]any, page, pageSize int) PaginateResult {
 		Page:     page,
 		PageSize: pageSize,
 	}
+}
+
+// PodStatusCounts returns a map of derived status → count for all pods.
+func (cc *ClusterCache) PodStatusCounts() map[string]int {
+	counts := make(map[string]int)
+	for _, pod := range cc.ListPodsRaw() {
+		s := podDerivedStatus(pod)
+		counts[s]++
+	}
+	return counts
 }
 
 func buildHTTPTransport(tlsSkip bool) *http.Transport {

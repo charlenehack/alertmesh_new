@@ -48,7 +48,6 @@ const K8sPods = lazy(() => import('./pages/k8s/K8sPods'))
 const K8sServiceRoutes = lazy(() => import('./pages/k8s/K8sServiceRoutes'))
 const K8sNodes = lazy(() => import('./pages/k8s/K8sNodes'))
 const K8sEvents = lazy(() => import('./pages/k8s/K8sEvents'))
-const K8sResourceQuotas = lazy(() => import('./pages/k8s/K8sResourceQuotas'))
 
 dayjs.extend(relativeTime)
 dayjs.locale('zh-cn')
@@ -145,7 +144,6 @@ function ThemedApp() {
               <Route path="k8s/services" element={<K8sServiceRoutes />} />
               <Route path="k8s/nodes" element={<K8sNodes />} />
               <Route path="k8s/events" element={<K8sEvents />} />
-              <Route path="k8s/resourcequotas" element={<K8sResourceQuotas />} />
             </Route>
             <Route path="*" element={<Navigate to="/" replace />} />
           </Routes>

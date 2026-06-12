@@ -12,7 +12,7 @@ import {
 } from '@ant-design/icons'
 import { useTheme } from '../../hooks/useTheme'
 import { http } from '../../api/request'
-import { byCreation, k8sPagination, fmtCreation, useNamespaces, useAutoRefresh } from './useCluster'
+import { byCreation, k8sPagination, fmtCreation, useNamespaces, useAutoRefresh, useK8sList } from './useCluster'
 import { YamlEditor } from './YamlEditor'
 
 const { Text } = Typography
@@ -26,7 +26,6 @@ interface EpItem {
   metadata?: { name?: string; namespace?: string; creationTimestamp?: string }
   subsets?: EpSubset[]
 }
-interface EpList { items?: EpItem[] }
 
 function epEndpoints(ep: EpItem) {
   const subsets = ep.subsets ?? []
@@ -44,17 +43,22 @@ function epEndpoints(ep: EpItem) {
 export function EndpointsTab({ dsId }: { dsId: string }) {
   const { c } = useTheme()
   const qc = useQueryClient()
-  const [ns, setNs] = useState('')
-  const [search, setSearch] = useState('')
   const [editTarget, setEditTarget] = useState<{ ns: string; name: string; readonly?: boolean } | null>(null)
 
-  const { data, isLoading, error, refetch } = useQuery<EpList>({
-    queryKey: ['k8s-endpoints', dsId, ns],
-    queryFn: () => http.get<EpList>('/k8s/endpoints', {
-      params: { ds: dsId, ...(ns ? { namespace: ns } : {}) },
-    }),
-    enabled: !!dsId,
-    staleTime: 15_000,
+  const {
+    data: items,
+    isLoading,
+    error,
+    refetch,
+    pagination,
+    search,
+    doSearch,
+    namespace: ns,
+    setNamespace: setNs,
+  } = useK8sList<EpItem>('/k8s/endpoints', {
+    dsId,
+    pageSize: 20,
+    searchDelay: 300,
   })
 
   const { data: namespaces = [] } = useNamespaces(dsId)
@@ -83,9 +87,7 @@ export function EndpointsTab({ dsId }: { dsId: string }) {
     onError: (e: Error) => message.error(e.message),
   })
 
-  const items = (data?.items ?? []).filter(ep =>
-    !search || (ep.metadata?.name ?? '').toLowerCase().includes(search.toLowerCase())
-  ).sort(byCreation)
+  const sortedItems = (items ?? []).sort(byCreation)
 
   const columns = [
     { title: 'Endpoint 名称', render: (_: unknown, ep: EpItem) => <Text style={{ fontFamily: 'monospace', fontSize: 12 }}>{ep.metadata?.name}</Text> },
@@ -163,7 +165,7 @@ export function EndpointsTab({ dsId }: { dsId: string }) {
           value={ns || undefined} onChange={v => setNs(v ?? '')}
           options={namespaces.map(n => ({ label: n, value: n }))} />
         <Input.Search placeholder="搜索 Endpoint 名称" allowClear style={{ width: 220 }}
-          onSearch={setSearch} onChange={e => !e.target.value && setSearch('')} />
+          onSearch={doSearch} onChange={e => !e.target.value && doSearch('')} />
         <Button icon={<ReloadOutlined />} onClick={() => refetch()} loading={isLoading}>刷新</Button>
         <Space size={4}>
           <Switch size="small" checked={autoRefresh.enabled} onChange={autoRefresh.setEnabled} />
@@ -175,10 +177,10 @@ export function EndpointsTab({ dsId }: { dsId: string }) {
         </Space>
       </Space>
       {error && <Alert type="error" message={(error as Error).message} style={{ marginBottom: 12 }} />}
-      <Table dataSource={items} columns={columns}
+      <Table dataSource={sortedItems} columns={columns}
         rowKey={ep => `${ep.metadata?.namespace}/${ep.metadata?.name}`}
         loading={isLoading} size="small" scroll={{ x: 'max-content' }}
-        pagination={k8sPagination} />
+        pagination={pagination} />
 
       <YamlEditor
         title={`${isReadonly ? '查看' : '编辑'} Endpoint: ${editTarget?.name ?? ''}`}

@@ -624,16 +624,31 @@ func (h *k8sMgmtHandler) overview(req *restful.Request, resp *restful.Response) 
 		nsCount = len(items)
 	}
 
-	// --- pods: use count from metadata (no full data pull) ---
-	podTotal := countViaListMeta(podCountData)
-	// Per-phase breakdown not available from limit=1; set all to 0.
-	// Frontend can fetch detailed pod list on demand.
-	podRunning, podPending, podFailed, podSucceeded, podUnknown := 0, 0, 0, 0, 0
+	// --- pods: 优先从缓存获取准确计数和状态分布 ---
+	var podTotal int
+	var podStatusDistribution map[string]int
+	if statusCounts, cacheErr := h.cacheMgr.PodStatusCounts(dsID); cacheErr == nil {
+		podStatusDistribution = statusCounts
+		for _, cnt := range statusCounts {
+			podTotal += cnt
+		}
+	} else {
+		// 缓存不可用，降级为 K8s API 计数（limit=1+remainingItemCount 或全量）
+		podTotal = countViaListMeta(podCountData)
+		podStatusDistribution = map[string]int{}
+	}
 
-	// --- workloads: use count from metadata ---
-	deployCount := countViaListMeta(deployCountData)
-	dsCount := countViaListMeta(dsCountData)
-	ssCount := countViaListMeta(ssCountData)
+	// --- workloads: 优先从缓存获取准确计数 ---
+	var deployCount, dsCount, ssCount int
+	if cc := h.cacheMgr.GetCache(dsID); cc != nil && cc.Ready() {
+		deployCount = cc.CountStore(k8scache.ResDeployments)
+		dsCount = cc.CountStore(k8scache.ResDaemonSets)
+		ssCount = cc.CountStore(k8scache.ResStatefulSets)
+	} else {
+		deployCount = countViaListMeta(deployCountData)
+		dsCount = countViaListMeta(dsCountData)
+		ssCount = countViaListMeta(ssCountData)
+	}
 
 	// --- metrics (usage from metrics-server) ---
 	var totalUsageCPUm, totalUsageMemKi int64
@@ -661,11 +676,6 @@ func (h *k8sMgmtHandler) overview(req *restful.Request, resp *restful.Response) 
 		"ready_nodes":       readyNodes,
 		"namespace_count":   nsCount,
 		"pod_total":         podTotal,
-		"pod_running":       podRunning,
-		"pod_pending":       podPending,
-		"pod_failed":        podFailed,
-		"pod_succeeded":     podSucceeded,
-		"pod_unknown":       podUnknown,
 		"deployment_count":  deployCount,
 		"daemonset_count":   dsCount,
 		"statefulset_count": ssCount,
@@ -679,7 +689,8 @@ func (h *k8sMgmtHandler) overview(req *restful.Request, resp *restful.Response) 
 		"mem_usage_rate":    memUsageRate,
 		"cpu_request_rate":  cpuRequestRate,
 		"mem_request_rate":  memRequestRate,
-		"metrics_available": metricsAvailable,
+		"metrics_available":     metricsAvailable,
+		"pod_status_distribution": podStatusDistribution,
 	})
 }
 
@@ -687,13 +698,16 @@ func (h *k8sMgmtHandler) overview(req *restful.Request, resp *restful.Response) 
 // parseSearchParams extracts common search/pagination params from the request.
 func parseSearchParams(req *restful.Request) k8scache.SearchParams {
 	return k8scache.SearchParams{
-		Search:    req.QueryParameter("search"),
-		Namespace: req.QueryParameter("namespace"),
-		Page:      intParam(req, "page", 1),
-		PageSize:  intParam(req, "pageSize", 20),
-		Phase:     req.QueryParameter("phase"),
-		NodeName:  req.QueryParameter("nodeName"),
-		Ready:     req.QueryParameter("ready"),
+		Search:        req.QueryParameter("search"),
+		Namespace:     req.QueryParameter("namespace"),
+		Page:          intParam(req, "page", 1),
+		PageSize:      intParam(req, "pageSize", 20),
+		Phase:         req.QueryParameter("phase"),
+		NodeName:      req.QueryParameter("nodeName"),
+		Ready:         req.QueryParameter("ready"),
+		LabelSelector: req.QueryParameter("labelSelector"),
+		ClusterIP:     req.QueryParameter("clusterIP"),
+		Hosts:         req.QueryParameter("hosts"),
 	}
 }
 
@@ -710,6 +724,8 @@ func intParam(req *restful.Request, key string, def int) int {
 }
 
 // cacheResultOrProxy writes cache result if available, otherwise falls back to proxy.
+// When falling back to proxy, the raw K8s response is converted to PaginateResult format
+// so the frontend always receives a consistent response structure.
 func (h *k8sMgmtHandler) cacheResultOrProxy(
 	req *restful.Request, resp *restful.Response,
 	dsID string, result k8scache.PaginateResult, err error, fallback func(),
@@ -755,63 +771,63 @@ func (h *k8sMgmtHandler) listServices(req *restful.Request, resp *restful.Respon
 }
 
 func (h *k8sMgmtHandler) listIngresses(req *restful.Request, resp *restful.Response) {
-	ns := req.QueryParameter("namespace")
 	dsID := req.QueryParameter("ds")
-	if dsID == "" {
-		httputil.BadRequest(resp, "缺少 ?ds=<cluster-id> 参数")
-		return
-	}
-	client, baseURL, token, err := h.k8sClient(dsID)
-	if err != nil {
-		httputil.BadRequest(resp, err.Error())
-		return
-	}
+	params := parseSearchParams(req)
+	result, err := h.cacheMgr.SearchGeneric(dsID, k8scache.ResIngresses, params)
+	h.cacheResultOrProxy(req, resp, dsID, result, err, func() {
+		ns := req.QueryParameter("namespace")
+		client, baseURL, token, proxyErr := h.k8sClient(dsID)
+		if proxyErr != nil {
+			httputil.BadRequest(resp, proxyErr.Error())
+			return
+		}
 
-	// 按 K8s 版本依次降级尝试 Ingress API
-	groups := []string{
-		"networking.k8s.io/v1",
-		"networking.k8s.io/v1beta1",
-		"extensions/v1beta1",
-	}
-	var lastBody []byte
-	for _, g := range groups {
-		var path string
-		if ns != "" {
-			path = "/apis/" + g + "/namespaces/" + ns + "/ingresses"
-		} else {
-			path = "/apis/" + g + "/ingresses"
+		// 按 K8s 版本依次降级尝试 Ingress API
+		groups := []string{
+			"networking.k8s.io/v1",
+			"networking.k8s.io/v1beta1",
+			"extensions/v1beta1",
 		}
-		fullURL := baseURL + path
-		k8sReq, _ := http.NewRequestWithContext(req.Request.Context(), http.MethodGet, fullURL, nil)
-		if token != "" {
-			k8sReq.Header.Set("Authorization", "Bearer "+token)
-		}
-		k8sReq.Header.Set("Accept", "application/json")
-		k8sResp, err := client.Do(k8sReq)
-		if err != nil {
-			httputil.InternalError(resp, "Kubernetes API 请求失败: "+err.Error())
+		var lastBody []byte
+		for _, g := range groups {
+			var path string
+			if ns != "" {
+				path = "/apis/" + g + "/namespaces/" + ns + "/ingresses"
+			} else {
+				path = "/apis/" + g + "/ingresses"
+			}
+			fullURL := baseURL + path
+			k8sReq, _ := http.NewRequestWithContext(req.Request.Context(), http.MethodGet, fullURL, nil)
+			if token != "" {
+				k8sReq.Header.Set("Authorization", "Bearer "+token)
+			}
+			k8sReq.Header.Set("Accept", "application/json")
+			k8sResp, proxyErr := client.Do(k8sReq)
+			if proxyErr != nil {
+				httputil.InternalError(resp, "Kubernetes API 请求失败: "+proxyErr.Error())
+				return
+			}
+			body, _ := io.ReadAll(io.LimitReader(k8sResp.Body, 32*1024*1024))
+			_ = k8sResp.Body.Close()
+			if k8sResp.StatusCode == http.StatusNotFound {
+				lastBody = body
+				continue // 该版本 API 不存在，尝试下一个
+			}
+			if k8sResp.StatusCode >= 400 {
+				httputil.Error(resp, k8sResp.StatusCode, fmt.Sprintf("Kubernetes API error: %s", string(body)))
+				return
+			}
+			var result any
+			if err := json.Unmarshal(body, &result); err != nil {
+				httputil.InternalError(resp, fmt.Sprintf("解析 Kubernetes API 响应失败 (body=%d bytes): %v", len(body), err))
+				return
+			}
+			httputil.Success(resp, result)
 			return
 		}
-		body, _ := io.ReadAll(io.LimitReader(k8sResp.Body, 32*1024*1024))
-		_ = k8sResp.Body.Close()
-		if k8sResp.StatusCode == http.StatusNotFound {
-			lastBody = body
-			continue // 该版本 API 不存在，尝试下一个
-		}
-		if k8sResp.StatusCode >= 400 {
-			httputil.Error(resp, k8sResp.StatusCode, fmt.Sprintf("Kubernetes API error: %s", string(body)))
-			return
-		}
-		var result any
-		if err := json.Unmarshal(body, &result); err != nil {
-			httputil.InternalError(resp, fmt.Sprintf("解析 Kubernetes API 响应失败 (body=%d bytes): %v", len(body), err))
-			return
-		}
-		httputil.Success(resp, result)
-		return
-	}
-	// 所有版本均 404
-	httputil.Error(resp, http.StatusNotFound, fmt.Sprintf("该集群不支持 Ingress API: %s", string(lastBody)))
+		// 所有版本均 404
+		httputil.Error(resp, http.StatusNotFound, fmt.Sprintf("该集群不支持 Ingress API: %s", string(lastBody)))
+	})
 }
 
 func (h *k8sMgmtHandler) listPVCs(req *restful.Request, resp *restful.Response) {

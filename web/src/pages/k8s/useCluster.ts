@@ -124,30 +124,46 @@ export interface K8sListResponse<T> {
   total: number
   page: number
   pageSize: number
+  availableStatuses?: string[]
 }
 
 interface UseK8sListOptions {
   dsId: string
   namespace?: string
+  /** Initial label selector (e.g. from URL params) */
+  labelSelector?: string
+  /** Initial node name filter */
+  nodeName?: string
   /** Initial page size */
   pageSize?: number
   /** Debounce delay for search (ms). 0 = no search, direct API call */
   searchDelay?: number
+  /** Additional query params to include in API calls (e.g. clusterIP, hosts) */
+  extraParams?: Record<string, string>
 }
 
 export function useK8sList<T = any>(
   endpoint: string,
   opts: UseK8sListOptions,
 ) {
-  const { dsId, namespace: ns, pageSize = 20, searchDelay = 300 } = opts
+  const { dsId, namespace: nsInit, labelSelector: lsInit, nodeName: nnInit, pageSize: pageSizeInit = 20, searchDelay = 300, extraParams } = opts
 
   const [search, setSearch] = useState('')
-  const [phase, setPhase] = useState('')
-  const [nodeName, setNodeName] = useState('')
-  const [ready, setReady] = useState('')
-  const [labelSelector, setLabelSelector] = useState('')
+  const [phase, setPhase_] = useState('')
+  const [nodeName, setNodeName_] = useState(nnInit ?? '')
+  const [ready, setReady_] = useState('')
+  const [labelSelector, setLabelSelector_] = useState(lsInit ?? '')
   const [page, setPage] = useState(1)
+  const [pageSize, setPageSize] = useState(pageSizeInit)
+  const [namespace, setNamespace_] = useState(nsInit ?? '')
   const timerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
+
+  // 筛选条件变化时重置到第1页
+  const setPhase = (v: string) => { setPhase_(v); setPage(1) }
+  const setNodeName = (v: string) => { setNodeName_(v); setPage(1) }
+  const setReady = (v: string) => { setReady_(v); setPage(1) }
+  const setLabelSelector = (v: string) => { setLabelSelector_(v); setPage(1) }
+  const setNamespace = (v: string) => { setNamespace_(v); setPage(1) }
 
   // Debounced search
   const doSearch = (keyword: string) => {
@@ -168,16 +184,38 @@ export function useK8sList<T = any>(
     page,
     pageSize,
   }
-  if (ns) params.namespace = ns
+  if (namespace) params.namespace = namespace
   if (search) params.search = search
   if (phase) params.phase = phase
   if (nodeName) params.nodeName = nodeName
   if (ready) params.ready = ready
   if (labelSelector) params.labelSelector = labelSelector
+  // 添加额外的查询参数（如 clusterIP、hosts）
+  if (extraParams) {
+    for (const [k, v] of Object.entries(extraParams)) {
+      if (v) params[k] = v
+    }
+  }
 
   const queryResult = useQuery<K8sListResponse<T>>({
-    queryKey: ['k8s-list', endpoint, dsId, ns, search, phase, nodeName, page, pageSize],
-    queryFn: () => http.get<K8sListResponse<T>>(endpoint, { params }),
+    queryKey: ['k8s-list', endpoint, dsId, namespace, search, phase, nodeName, ready, labelSelector, page, pageSize, extraParams],
+    queryFn: async () => {
+      const raw = await http.get<any>(endpoint, { params })
+      // 兼容两种响应格式：
+      // 1. 缓存可用时返回 K8sListResponse { items, total, page, pageSize }
+      // 2. 缓存不可用时 fallback 返回原始 K8s 格式 { kind, items, metadata }
+      if (raw && typeof raw.total === 'number') {
+        return raw as K8sListResponse<T>
+      }
+      // 原始 K8s 格式 → 转换为 K8sListResponse
+      const items: T[] = raw?.items ?? []
+      return {
+        items,
+        total: items.length,
+        page: 1,
+        pageSize: items.length || 20,
+      } as K8sListResponse<T>
+    },
     enabled: !!dsId,
     staleTime: 5_000,
   })
@@ -194,12 +232,14 @@ export function useK8sList<T = any>(
     showTotal: (t: number) => `共 ${t} 个`,
     onChange: (p: number, ps: number) => {
       if (ps !== pageSize) {
+        setPageSize(ps)
         setPage(1)
       } else {
         setPage(p)
       }
     },
     onShowSizeChange: (_: unknown, ps: number) => {
+      setPageSize(ps)
       setPage(1)
     },
   }), [page, pageSize, queryResult.data?.total])
@@ -213,9 +253,12 @@ export function useK8sList<T = any>(
     pagination,
     search, doSearch,
     phase, setPhase,
+    namespace, setNamespace,
     nodeName, setNodeName,
     ready, setReady,
     labelSelector, setLabelSelector,
     page, setPage,
+    /** Raw query result – access extra fields like availableStatuses */
+    raw: queryResult,
   }
 }

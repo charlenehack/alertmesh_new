@@ -9,7 +9,7 @@ import { PageHeader } from '../../components/PageHeader'
 import { SurfaceCard } from '../../components/SurfaceCard'
 import { useTheme } from '../../hooks/useTheme'
 import { http } from '../../api/request'
-import { useClusters, useSelectedCluster, byCreation, k8sPagination, fmtCreation, useNamespaces } from './useCluster'
+import { useClusters, useSelectedCluster, byCreation, k8sPagination, fmtCreation, useNamespaces, useK8sList } from './useCluster'
 import { ClusterSelector } from './ClusterSelector'
 import { YamlEditor } from './YamlEditor'
 
@@ -19,13 +19,11 @@ interface ServiceItem {
   metadata?: { name?: string; namespace?: string; creationTimestamp?: string }
   spec?: { type?: string; clusterIP?: string; ports?: { port: number; protocol: string; targetPort: unknown }[] }
 }
-interface ServiceList { items?: ServiceItem[] }
 
 interface IngressItem {
   metadata?: { name?: string; namespace?: string; creationTimestamp?: string }
   spec?: { rules?: { host?: string; http?: { paths?: { path?: string; backend?: unknown }[] } }[] }
 }
-interface IngressList { items?: IngressItem[] }
 
 const serviceTypeColor: Record<string, string> = {
   ClusterIP: 'blue', NodePort: 'orange', LoadBalancer: 'green', ExternalName: 'purple',
@@ -36,18 +34,25 @@ const serviceTypeColor: Record<string, string> = {
 function ServicesTab({ dsId }: { dsId: string }) {
   const { c } = useTheme()
   const qc = useQueryClient()
-  const [ns, setNs] = useState('')
-  const [search, setSearch] = useState('')
   const [editTarget, setEditTarget] = useState<{ ns: string; name: string } | null>(null)
   const { data: namespaces = [] } = useNamespaces(dsId)
+  const [clusterIP, setClusterIP] = useState('')
 
-  const { data, isLoading, error, refetch } = useQuery<ServiceList>({
-    queryKey: ['k8s-services', dsId, ns],
-    queryFn: () => http.get<ServiceList>('/k8s/services', {
-      params: { ds: dsId, ...(ns ? { namespace: ns } : {}) },
-    }),
-    enabled: !!dsId,
-    staleTime: 15_000,
+  const {
+    data: items,
+    isLoading,
+    error,
+    refetch,
+    pagination,
+    search,
+    doSearch,
+    namespace: ns,
+    setNamespace: setNs,
+  } = useK8sList<ServiceItem>('/k8s/services', {
+    dsId,
+    pageSize: 20,
+    searchDelay: 300,
+    extraParams: clusterIP ? { clusterIP } : undefined,
   })
 
   const { data: svcDetail, isFetching: svcFetching } = useQuery<unknown>({
@@ -73,9 +78,7 @@ function ServicesTab({ dsId }: { dsId: string }) {
     onError: (e: Error) => message.error(e.message),
   })
 
-  const items = (data?.items ?? []).filter(s =>
-    !search || (s.metadata?.name ?? '').toLowerCase().includes(search.toLowerCase())
-  ).sort(byCreation)
+  const sortedItems = (items ?? []).sort(byCreation)
 
   const columns = [
     {
@@ -138,14 +141,16 @@ function ServicesTab({ dsId }: { dsId: string }) {
           options={namespaces.map(n => ({ label: n, value: n }))}
         />
         <Input.Search placeholder="搜索 Service 名称" allowClear style={{ width: 220 }}
-          onSearch={setSearch} onChange={e => !e.target.value && setSearch('')} />
+          onSearch={doSearch} onChange={e => !e.target.value && doSearch('')} />
+        <Input.Search placeholder="搜索 ClusterIP" allowClear style={{ width: 180 }}
+          onSearch={v => setClusterIP(v)} onChange={e => !e.target.value && setClusterIP('')} />
         <Button icon={<ReloadOutlined />} onClick={() => refetch()} loading={isLoading}>刷新</Button>
       </Space>
       {error && <Alert type="error" message={(error as Error).message} style={{ marginBottom: 8 }} />}
-      <Table dataSource={items} columns={columns}
+      <Table dataSource={sortedItems} columns={columns}
         rowKey={s => `${s.metadata?.namespace}/${s.metadata?.name}`}
         loading={isLoading} size="small" scroll={{ x: 'max-content' }}
-        pagination={k8sPagination} />
+        pagination={pagination} />
 
       <YamlEditor
         title={`编辑 Service: ${editTarget?.name ?? ''}`}
@@ -164,18 +169,25 @@ function ServicesTab({ dsId }: { dsId: string }) {
 function IngressesTab({ dsId }: { dsId: string }) {
   const { c } = useTheme()
   const qc = useQueryClient()
-  const [ns, setNs] = useState('')
-  const [search, setSearch] = useState('')
   const [editTarget, setEditTarget] = useState<{ ns: string; name: string } | null>(null)
   const { data: namespaces = [] } = useNamespaces(dsId)
+  const [hostsSearch, setHostsSearch] = useState('')
 
-  const { data, isLoading, error, refetch } = useQuery<IngressList>({
-    queryKey: ['k8s-ingresses', dsId, ns],
-    queryFn: () => http.get<IngressList>('/k8s/ingresses', {
-      params: { ds: dsId, ...(ns ? { namespace: ns } : {}) },
-    }),
-    enabled: !!dsId,
-    staleTime: 15_000,
+  const {
+    data: items,
+    isLoading,
+    error,
+    refetch,
+    pagination,
+    search,
+    doSearch,
+    namespace: ns,
+    setNamespace: setNs,
+  } = useK8sList<IngressItem>('/k8s/ingresses', {
+    dsId,
+    pageSize: 20,
+    searchDelay: 300,
+    extraParams: hostsSearch ? { hosts: hostsSearch } : undefined,
   })
 
   const { data: ingDetail, isFetching: ingFetching } = useQuery<unknown>({
@@ -201,9 +213,7 @@ function IngressesTab({ dsId }: { dsId: string }) {
     onError: (e: Error) => message.error(e.message),
   })
 
-  const items = (data?.items ?? []).filter(i =>
-    !search || (i.metadata?.name ?? '').toLowerCase().includes(search.toLowerCase())
-  ).sort(byCreation)
+  const sortedItems = (items ?? []).sort(byCreation)
 
   const columns = [
     {
@@ -265,14 +275,16 @@ function IngressesTab({ dsId }: { dsId: string }) {
           options={namespaces.map(n => ({ label: n, value: n }))}
         />
         <Input.Search placeholder="搜索 Ingress 名称" allowClear style={{ width: 220 }}
-          onSearch={setSearch} onChange={e => !e.target.value && setSearch('')} />
+          onSearch={doSearch} onChange={e => !e.target.value && doSearch('')} />
+        <Input.Search placeholder="搜索 Hosts" allowClear style={{ width: 200 }}
+          onSearch={v => setHostsSearch(v)} onChange={e => !e.target.value && setHostsSearch('')} />
         <Button icon={<ReloadOutlined />} onClick={() => refetch()} loading={isLoading}>刷新</Button>
       </Space>
       {error && <Alert type="error" message={(error as Error).message} style={{ marginBottom: 8 }} />}
-      <Table dataSource={items} columns={columns}
+      <Table dataSource={sortedItems} columns={columns}
         rowKey={i => `${i.metadata?.namespace}/${i.metadata?.name}`}
         loading={isLoading} size="small" scroll={{ x: 'max-content' }}
-        pagination={k8sPagination} />
+        pagination={pagination} />
 
       <YamlEditor
         title={`编辑 Ingress: ${editTarget?.name ?? ''}`}
