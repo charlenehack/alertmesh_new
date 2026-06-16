@@ -171,6 +171,13 @@ ALERTMESH_LOG_LEVEL=info
 ALERTMESH_LOG_FORMAT=json
 ALERTMESH_AI_WORKERS=2
 
+# ── K8s 缓存兼容性 ────────────────────────────────────────────────
+# WatchListClient 是 client-go v0.35+ 默认开启的新特性（利用 Watch 替代 List 初始化缓存）。
+# 如果被管集群中存在 Kubernetes <= v1.20 的老版本集群，必须设置为 false，
+# 否则这些集群的缓存将无法就绪，搜索功能失效。
+# 如果所有集群均为 v1.27+，可删除此行或设为 true（性能更好，内存占用更低）。
+KUBE_FEATURE_WatchListClient=false
+
 # ── 可选 ─────────────────────────────────────────────────────────
 # ALERTMESH_PROMETHEUS_URL=http://prometheus:9090
 # ALERTMESH_OPENSEARCH_URL=http://opensearch:9200
