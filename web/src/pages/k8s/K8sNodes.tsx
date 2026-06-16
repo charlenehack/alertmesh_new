@@ -2,7 +2,7 @@
  * K8sNodes – 节点管理
  * 标签查看/编辑、污点查看/编辑、停止/加入调度、删除
  */
-import { useState } from 'react'
+import { useState, useMemo } from 'react'
 import { useNavigate } from 'react-router-dom'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import {
@@ -344,14 +344,25 @@ export default function K8sNodes() {
   const [taintNode, setTaintNode] = useState<NodeItem | null>(null)
   const [viewTarget, setViewTarget] = useState<string | null>(null)
   const [eventNode, setEventNode] = useState<string | null>(null)
+  const [search, setSearch] = useState('')
 
   const { data, isLoading, error, refetch } = useQuery<NodeList>({
     queryKey: ['k8s-nodes', dsId],
-    queryFn: () => http.get<NodeList>('/k8s/nodes', { params: { ds: dsId } }),
+    queryFn: () => http.get<NodeList>('/k8s/nodes', { params: { ds: dsId, pageSize: -1 } }),
     enabled: !!dsId,
     staleTime: 15_000,
     refetchInterval: 30_000,
   })
+
+  const filteredNodes = useMemo(() => {
+    const items = data?.items ?? []
+    if (!search) return items
+    const lower = search.toLowerCase()
+    return items.filter(n =>
+      (n.metadata?.name ?? '').toLowerCase().includes(lower) ||
+      nodeInternalIP(n).includes(lower)
+    )
+  }, [data, search])
 
   const { data: nodeDetail, isFetching: nodeFetching } = useQuery<unknown>({
     queryKey: ['k8s-node-view', dsId, viewTarget],
@@ -535,15 +546,26 @@ export default function K8sNodes() {
         {error && <Alert type="error" message={(error as Error).message} style={{ marginBottom: 12 }} />}
         {!dsId && <Alert type="info" message="请先从上方选择一个集群" />}
         {dsId && (
-          <Table
-            dataSource={data?.items ?? []}
-            columns={columns}
-            rowKey={n => n.metadata?.name ?? ''}
-            loading={isLoading}
-            size="small"
-            scroll={{ x: 'max-content' }}
-            pagination={false}
-          />
+          <>
+            <div style={{ marginBottom: 12 }}>
+              <Input.Search
+                placeholder="搜索节点名/IP"
+                allowClear
+                value={search}
+                onChange={e => setSearch(e.target.value)}
+                style={{ width: 260 }}
+              />
+            </div>
+            <Table
+              dataSource={filteredNodes}
+              columns={columns}
+              rowKey={n => n.metadata?.name ?? ''}
+              loading={isLoading}
+              size="small"
+              scroll={{ x: 'max-content' }}
+              pagination={{ pageSize: 20, showSizeChanger: true, showTotal: t => `共 ${t} 个节点` }}
+            />
+          </>
         )}
       </SurfaceCard>
 

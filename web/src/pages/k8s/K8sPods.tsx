@@ -1189,12 +1189,13 @@ function PodLogModal({ dsId, open, onClose, target }: { dsId: string; open: bool
   const preRef = useRef<HTMLPreElement>(null)
   const [aiOpen, setAiOpen] = useState(false)
   const [previous, setPrevious] = useState(false)
+  const [tail, setTail] = useState<number>(500)
   const canPrevious = (target?.restartCount ?? 0) > 0
-  // 关闭时重置 previous 开关
-  useEffect(() => { if (!open) setPrevious(false) }, [open])
+  // 关闭时重置开关
+  useEffect(() => { if (!open) { setPrevious(false); setTail(500) } }, [open])
   const { data, isLoading, error } = useQuery<string>({
-    queryKey: ['k8s-pod-logs', dsId, target?.ns, target?.name, target?.container, previous],
-    queryFn: () => http.get<string>(`/k8s/pod/logs?ds=${dsId}&namespace=${target?.ns}&name=${target?.name}&container=${target?.container}${previous ? '&previous=true' : ''}`),
+    queryKey: ['k8s-pod-logs', dsId, target?.ns, target?.name, target?.container, previous, tail],
+    queryFn: () => http.get<string>(`/k8s/pod/logs?ds=${dsId}&namespace=${target?.ns}&name=${target?.name}&container=${target?.container}&tail=${tail}${previous ? '&previous=true' : ''}`),
     enabled: open && !!target,
   })
   // 数据加载完后自动滚到底
@@ -1213,6 +1214,20 @@ function PodLogModal({ dsId, open, onClose, target }: { dsId: string; open: bool
               disabled={!canPrevious}
               checkedChildren="上次运行" unCheckedChildren="当前"
               title={canPrevious ? '' : '该容器未发生重启，无上次日志'} />
+            <Select
+              size="small"
+              value={tail}
+              onChange={v => setTail(v)}
+              options={[
+                { label: '最后 100 行', value: 100 },
+                { label: '最后 200 行', value: 200 },
+                { label: '最后 500 行', value: 500 },
+                { label: '最后 1000 行', value: 1000 },
+                { label: '最后 2000 行', value: 2000 },
+                { label: '全部', value: 0 },
+              ]}
+              style={{ width: 120 }}
+            />
           </Space>
         }
         open={open} onCancel={onClose} width={900}

@@ -133,7 +133,6 @@ func (cc *ClusterCache) startInformers() {
 		cc.stores[spec.res] = store
 		cc.mu.Unlock()
 		spec.inf.AddEventHandler(cache.ResourceEventHandlerFuncs{})
-		go spec.inf.Run(cc.stopCh)
 	}
 
 	go cc.startDynamicInformerWithFallback(ResIngresses, []schema.GroupVersionResource{
@@ -151,18 +150,38 @@ func (cc *ClusterCache) startInformers() {
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 		defer cancel()
 
-		allSynced := true
-		for _, spec := range infs {
-			if !cache.WaitForCacheSync(ctx.Done(), spec.inf.HasSynced) {
-				allSynced = false
-				log.Warn().Str("ds", cc.dsID).Str("resource", string(spec.res)).Msg("informer sync timeout")
-			}
+		// 并行等待所有 informer 同步完成
+		hasSyncedFuncs := make([]cache.InformerSynced, len(infs))
+		for i, spec := range infs {
+			hasSyncedFuncs[i] = spec.inf.HasSynced
 		}
-		if allSynced {
+		if cache.WaitForCacheSync(ctx.Done(), hasSyncedFuncs...) {
 			cc.mu.Lock()
 			cc.ready = true
 			cc.mu.Unlock()
 			log.Info().Str("ds", cc.dsID).Str("name", cc.name).Msg("k8s cache synced and ready")
+		} else {
+			// 部分 informer 超时（如某些资源不存在），检查核心资源是否就绪
+			coreReady := 0
+			for _, spec := range infs {
+				if spec.inf.HasSynced() {
+					if spec.res == ResPods || spec.res == ResDeployments {
+						coreReady++
+					}
+					log.Info().Str("ds", cc.dsID).Str("resource", string(spec.res)).Msg("informer synced")
+				} else {
+					log.Warn().Str("ds", cc.dsID).Str("resource", string(spec.res)).Msg("informer sync timeout")
+				}
+			}
+			if coreReady >= 2 {
+				cc.mu.Lock()
+				cc.ready = true
+				cc.mu.Unlock()
+				log.Info().Str("ds", cc.dsID).Str("name", cc.name).Msg("k8s cache ready (core resources synced)")
+			} else {
+				log.Warn().Str("ds", cc.dsID).Str("name", cc.name).Int("coreReady", coreReady).
+					Msg("k8s cache not ready: core resources failed to sync")
+			}
 		}
 		close(cc.readyCh)
 	}()
@@ -172,29 +191,46 @@ func (cc *ClusterCache) startInformers() {
 
 func (cc *ClusterCache) startDynamicInformerWithFallback(res ResourceType, gvrs []schema.GroupVersionResource) {
 	for _, gvr := range gvrs {
-		// 每个版本使用独立的 factory，避免 GVR 间互相干扰
-		dynFactory := dynamicinformer.NewFilteredDynamicSharedInformerFactory(cc.dynCli, 5*time.Minute, "", nil)
-		inf := dynFactory.ForResource(gvr).Informer()
+		// 用独立的 factory 探测版本可用性（30s 超时）
+		probeFactory := dynamicinformer.NewFilteredDynamicSharedInformerFactory(cc.dynCli, 5*time.Minute, "", nil)
+		probeInf := probeFactory.ForResource(gvr).Informer()
 
-		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-		dynFactory.Start(ctx.Done()) // 启动 factory 内所有已注册的 informer
+		probeCtx, probeCancel := context.WithTimeout(context.Background(), 30*time.Second)
+		probeFactory.Start(probeCtx.Done())
+		synced := cache.WaitForCacheSync(probeCtx.Done(), probeInf.HasSynced)
+		probeCancel()
 
-		synced := cache.WaitForCacheSync(ctx.Done(), inf.HasSynced)
-		cancel() // 立即释放 context，而非 defer
-
-		if synced {
-			cc.mu.Lock()
-			cc.stores[res] = inf.GetStore()
-			cc.mu.Unlock()
-			log.Info().Str("ds", cc.dsID).Str("resource", string(res)).Str("gvr", gvr.Group+"/"+gvr.Version).Msg("dynamic informer synced")
-			return
+		if !synced {
+			// 该版本不可用，尝试下一版本
+			log.Warn().Str("ds", cc.dsID).Str("resource", string(res)).
+				Str("gvr", gvr.Group+"/"+gvr.Version).
+				Msg("dynamic informer version not available, trying next")
+			continue
 		}
-		// 当前版本不可用，清理后尝试下一版本
-		log.Warn().Str("ds", cc.dsID).Str("resource", string(res)).Str("gvr", gvr.Group+"/"+gvr.Version).Msg("dynamic informer version not available, trying next")
+
+		// 版本可用：用 cc.stopCh 启动长期运行的 factory，保持 store 持续同步
+		liveFactory := dynamicinformer.NewFilteredDynamicSharedInformerFactory(cc.dynCli, 5*time.Minute, "", nil)
+		liveInf := liveFactory.ForResource(gvr).Informer()
+		liveFactory.Start(cc.stopCh)
+
+		// 等待长期 informer 完成初次同步（最多 2 分钟）
+		syncCtx, syncCancel := context.WithTimeout(context.Background(), 2*time.Minute)
+		cache.WaitForCacheSync(syncCtx.Done(), liveInf.HasSynced)
+		syncCancel()
+
+		cc.mu.Lock()
+		cc.stores[res] = liveInf.GetStore()
+		cc.mu.Unlock()
+
+		log.Info().Str("ds", cc.dsID).Str("resource", string(res)).
+			Str("gvr", gvr.Group+"/"+gvr.Version).
+			Msg("dynamic informer synced and running")
+		return
 	}
 
-	// All versions failed
-	log.Warn().Str("ds", cc.dsID).Str("resource", string(res)).Msg("all dynamic informer versions failed")
+	// 所有版本均不可用
+	log.Warn().Str("ds", cc.dsID).Str("resource", string(res)).
+		Msg("all dynamic informer versions failed")
 }
 
 func (cc *ClusterCache) Stop() {
@@ -280,6 +316,10 @@ func paginate(items []map[string]any, page, pageSize int) PaginateResult {
 	total := len(items)
 	if page < 1 {
 		page = 1
+	}
+	// pageSize=-1 表示全量返回，不分页
+	if pageSize == -1 {
+		return PaginateResult{Items: items, Total: total, Page: 1, PageSize: total}
 	}
 	if pageSize < 1 {
 		pageSize = 20

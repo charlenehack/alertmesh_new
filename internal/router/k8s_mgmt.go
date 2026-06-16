@@ -370,6 +370,8 @@ func (h *k8sMgmtHandler) k8sClient(dsID string) (client *http.Client, baseURL st
 
 // proxyK8s makes a GET request to the Kubernetes API server and returns the
 // parsed JSON body.  Any non-2xx response is surfaced as an error.
+// If the API returns 400/422 (e.g. unsupported fieldSelector on older K8s),
+// it automatically retries once without the fieldSelector parameter.
 func (h *k8sMgmtHandler) proxyK8s(req *restful.Request, resp *restful.Response, path string) {
 	dsID := req.QueryParameter("ds")
 	if dsID == "" {
@@ -391,37 +393,60 @@ func (h *k8sMgmtHandler) proxyK8s(req *restful.Request, resp *restful.Response, 
 	if params.Get("limit") == "" && params.Get("continue") == "" {
 		params.Set("limit", "500")
 	}
-	fullURL := baseURL + path
-	if rest := params.Encode(); rest != "" {
-		sep := "?"
-		if strings.Contains(path, "?") {
-			sep = "&"
+
+	doRequest := func(p url.Values) ([]byte, int, error) {
+		fullURL := baseURL + path
+		if rest := p.Encode(); rest != "" {
+			sep := "?"
+			if strings.Contains(path, "?") {
+				sep = "&"
+			}
+			fullURL += sep + rest
 		}
-		fullURL += sep + rest
+		k8sReq, _ := http.NewRequestWithContext(req.Request.Context(), http.MethodGet, fullURL, nil)
+		if token != "" {
+			k8sReq.Header.Set("Authorization", "Bearer "+token)
+		}
+		k8sReq.Header.Set("Accept", "application/json")
+		k8sResp, err := client.Do(k8sReq)
+		if err != nil {
+			return nil, 0, err
+		}
+		defer func() { _ = k8sResp.Body.Close() }()
+		body, _ := io.ReadAll(io.LimitReader(k8sResp.Body, 32*1024*1024))
+		return body, k8sResp.StatusCode, nil
 	}
 
-	k8sReq, _ := http.NewRequestWithContext(req.Request.Context(), http.MethodGet, fullURL, nil)
-	if token != "" {
-		k8sReq.Header.Set("Authorization", "Bearer "+token)
-	}
-	k8sReq.Header.Set("Accept", "application/json")
-
-	k8sResp, err := client.Do(k8sReq)
+	body, statusCode, err := doRequest(params)
 	if err != nil {
 		httputil.InternalError(resp, "Kubernetes API 请求失败: "+err.Error())
 		return
 	}
-	defer func() { _ = k8sResp.Body.Close() }()
 
-	body, _ := io.ReadAll(io.LimitReader(k8sResp.Body, 32*1024*1024)) // 32 MB max
-	if k8sResp.StatusCode >= 400 {
-		httputil.Error(resp, k8sResp.StatusCode, fmt.Sprintf("Kubernetes API error: %s", string(body)))
+	// 兼容旧版 K8s（如 v1.15）：fieldSelector 使用 != 运算符时会返回 400/422
+	// 自动降级：去掉 fieldSelector 重试
+	if (statusCode == http.StatusBadRequest || statusCode == http.StatusUnprocessableEntity) &&
+		params.Get("fieldSelector") != "" {
+		retryParams := url.Values{}
+		for k, v := range params {
+			if k != "fieldSelector" {
+				retryParams[k] = v
+			}
+		}
+		body, statusCode, err = doRequest(retryParams)
+		if err != nil {
+			httputil.InternalError(resp, "Kubernetes API 请求失败: "+err.Error())
+			return
+		}
+	}
+
+	if statusCode >= 400 {
+		httputil.Error(resp, statusCode, fmt.Sprintf("Kubernetes API error: %s", string(body)))
 		return
 	}
 
 	var result any
 	if err := json.Unmarshal(body, &result); err != nil {
-		// body may have been truncated – return what we have as text for diagnosis
 		httputil.InternalError(resp, fmt.Sprintf("解析 Kubernetes API 响应失败 (body=%d bytes): %v", len(body), err))
 		return
 	}
@@ -1467,14 +1492,24 @@ func (h *k8sMgmtHandler) podLogs(req *restful.Request, resp *restful.Response) {
 		httputil.BadRequest(resp, "缺少 namespace 或 name 参数")
 		return
 	}
-	container := req.QueryParameter("container")
-	previous := req.QueryParameter("previous")
 	q := url.Values{}
-	if container != "" {
-		q.Set("container", container)
+	if v := req.QueryParameter("container"); v != "" {
+		q.Set("container", v)
 	}
-	if previous == "true" {
+	if req.QueryParameter("previous") == "true" {
 		q.Set("previous", "true")
+	}
+	// 透传 tail 行数（0 表示不限制，不传 tailLines 给 k8s）
+	if v := req.QueryParameter("tail"); v != "" && v != "0" {
+		q.Set("tailLines", v)
+	}
+	// 透传 sinceSeconds（最近 N 秒）
+	if v := req.QueryParameter("sinceSeconds"); v != "" {
+		q.Set("sinceSeconds", v)
+	}
+	// 透传 timestamps（每行前缀时间戳）
+	if req.QueryParameter("timestamps") == "true" {
+		q.Set("timestamps", "true")
 	}
 	path := "/api/v1/namespaces/" + ns + "/pods/" + name + "/log"
 	if len(q) > 0 {
@@ -2461,14 +2496,14 @@ type historyEntry struct {
 	Revision          string          `json:"revision"`
 	Name              string          `json:"name"`
 	CreationTimestamp string          `json:"creationTimestamp"`
-	Replicas          int             `json:"replicas,omitempty"`
-	ReadyReplicas     int             `json:"readyReplicas,omitempty"`
+	Replicas          int             `json:"replicas"`
+	ReadyReplicas     int             `json:"readyReplicas"`
 	Template          json.RawMessage `json:"template"`
 }
 
 type ownerRef struct {
 	Kind string `json:"kind"`
-	Name string `json:"kind"`
+	Name string `json:"name"`
 }
 
 // getSelectorLabels fetches a workload resource and extracts spec.selector.matchLabels.
@@ -2639,22 +2674,24 @@ func (h *k8sMgmtHandler) listDeploymentHistory(req *restful.Request, resp *restf
 		return
 	}
 
-	// Enrich with replica info
+	// Enrich with replica count, creationTimestamp and container images
 	type rsFull struct {
 		Metadata struct {
-			Name            string            `json:"name"`
-			Annotations     map[string]string `json:"annotations"`
-			OwnerReferences []ownerRef        `json:"ownerReferences"`
+			Name              string            `json:"name"`
+			Annotations       map[string]string `json:"annotations"`
+			OwnerReferences   []ownerRef        `json:"ownerReferences"`
+			CreationTimestamp string            `json:"creationTimestamp"`
 		} `json:"metadata"`
 		Spec struct {
-			Replicas int `json:"replicas"`
+			Replicas int             `json:"replicas"`
+			Template json.RawMessage `json:"template"`
 		} `json:"spec"`
 		Status struct {
 			Replicas      int `json:"replicas"`
 			ReadyReplicas int `json:"readyReplicas"`
 		} `json:"status"`
 	}
-	// Re-fetch to get replica counts (historyEntry doesn't have them yet)
+	// Re-fetch to get all fields (historyEntry from listOwnedHistory lacks replicas/timestamp/template)
 	var enriched []historyEntry
 	data, status, _ := h.k8sWriteReq(ctx, client, baseURL, token, http.MethodGet, rsPath, "", nil)
 	if status < 400 {
@@ -2676,16 +2713,25 @@ func (h *k8sMgmtHandler) listDeploymentHistory(req *restful.Request, resp *restf
 					continue
 				}
 				rev := rs.Metadata.Annotations["deployment.kubernetes.io/revision"]
+				if rev == "" {
+					continue
+				}
 				enriched = append(enriched, historyEntry{
 					Revision:          rev,
 					Name:              rs.Metadata.Name,
 					Replicas:          rs.Spec.Replicas,
 					ReadyReplicas:     rs.Status.ReadyReplicas,
-					CreationTimestamp: "",
+					CreationTimestamp: rs.Metadata.CreationTimestamp,
+					Template:          rs.Spec.Template,
 				})
 			}
 		}
 	}
+	sort.Slice(enriched, func(i, j int) bool {
+		ri, _ := strconv.Atoi(enriched[i].Revision)
+		rj, _ := strconv.Atoi(enriched[j].Revision)
+		return ri > rj
+	})
 	if enriched != nil {
 		httputil.Success(resp, enriched)
 	} else {
@@ -2938,13 +2984,82 @@ func (h *k8sMgmtHandler) rollbackDaemonSet(req *restful.Request, resp *restful.R
 	h.patchWorkloadTemplate(req, resp,
 		"/apis/apps/v1/namespaces/"+ns+"/daemonsets/"+name, template)
 }
+// podDescribe assembles a kubectl-describe-style summary for a single pod:
+// pod detail + related events, returned as a structured JSON object.
 func (h *k8sMgmtHandler) podDescribe(req *restful.Request, resp *restful.Response) {
 	ns, name, ok := nsName(req)
 	if !ok {
 		httputil.BadRequest(resp, "缺少 namespace 或 name 参数")
 		return
 	}
-	h.doGet(req, resp, "/api/v1/namespaces/"+ns+"/pods/"+name)
+	dsID := req.QueryParameter("ds")
+	client, baseURL, token, err := h.k8sClient(dsID)
+	if err != nil {
+		httputil.BadRequest(resp, err.Error())
+		return
+	}
+	ctx := req.Request.Context()
+
+	doGet := func(path string) (map[string]any, error) {
+		r, e := http.NewRequestWithContext(ctx, http.MethodGet, baseURL+path, nil)
+		if e != nil {
+			return nil, e
+		}
+		if token != "" {
+			r.Header.Set("Authorization", "Bearer "+token)
+		}
+		r.Header.Set("Accept", "application/json")
+		res, e := client.Do(r)
+		if e != nil {
+			return nil, e
+		}
+		defer func() { _ = res.Body.Close() }()
+		b, _ := io.ReadAll(io.LimitReader(res.Body, 8*1024*1024))
+		if res.StatusCode >= 400 {
+			return nil, fmt.Errorf("K8s API %s returned %d: %s", path, res.StatusCode, string(b))
+		}
+		out := map[string]any{}
+		if e := json.Unmarshal(b, &out); e != nil {
+			return nil, e
+		}
+		return out, nil
+	}
+
+	// 并发拉取 pod 详情 + 相关事件
+	g, _ := errgroup.WithContext(ctx)
+	var podDetail, eventsData map[string]any
+
+	g.Go(func() error {
+		var e error
+		podDetail, e = doGet("/api/v1/namespaces/" + ns + "/pods/" + name)
+		return e
+	})
+	g.Go(func() error {
+		evPath := fmt.Sprintf(
+			"/api/v1/namespaces/%s/events?fieldSelector=involvedObject.name=%s,involvedObject.namespace=%s,involvedObject.kind=Pod",
+			ns, name, ns,
+		)
+		var e error
+		eventsData, e = doGet(evPath)
+		_ = e // events 拉取失败不影响主体展示
+		return nil
+	})
+	if err := g.Wait(); err != nil {
+		httputil.InternalError(resp, "获取 Pod 详情失败: "+err.Error())
+		return
+	}
+
+	events := []any{}
+	if eventsData != nil {
+		if items, ok := eventsData["items"].([]any); ok {
+			events = items
+		}
+	}
+
+	httputil.Success(resp, map[string]any{
+		"pod":    podDetail,
+		"events": events,
+	})
 }
 
 // ─── podMetrics: proxy metrics-server for pod CPU/memory ──────────────────────
