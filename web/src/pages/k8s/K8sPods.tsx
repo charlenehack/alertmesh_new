@@ -947,12 +947,13 @@ function PodDescribeDrawer({
   const { c } = useTheme()
   const [aiOpen, setAiOpen] = useState(false)
   const [logModal, setLogModal] = useState<{ ns: string; name: string; container: string; restartCount?: number } | null>(null)
-  const { data: pod, isLoading } = useQuery<any>({
+  const { data: describeData, isLoading } = useQuery<any>({
     queryKey: ['k8s-pod-describe', dsId, target?.ns, target?.name],
     queryFn: () => http.get<any>(`/k8s/pod/describe?ds=${dsId}&namespace=${target?.ns}&name=${target?.name}`),
     enabled: open && !!target,
     staleTime: 0,
   })
+  const pod = describeData?.pod
 
   const containerStatuses: any[] = pod?.status?.containerStatuses ?? []
   const initStatuses: any[] = pod?.status?.initContainerStatuses ?? []

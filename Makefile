@@ -10,7 +10,7 @@ LDFLAGS := -s -w
 all: build
 
 build:
-	$(GO) build $(GOFLAGS) -ldflags "$(LDFLAGS)" -o $(BUILD_DIR)/$(APP_NAME) ./cmd/alertmesh
+	CGO_ENABLED=0 $(GO) build $(GOFLAGS) -ldflags "$(LDFLAGS)" -o $(BUILD_DIR)/$(APP_NAME) ./cmd/alertmesh
 
 run:
 	$(GO) run ./cmd/alertmesh
