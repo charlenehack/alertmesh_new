@@ -536,10 +536,7 @@ export default function K8sNodes() {
       <PageHeader
         title="节点管理"
         extra={
-          <Space>
-            <ClusterSelector clusters={clusters ?? []} value={dsId} onChange={select} />
-            <Button icon={<ReloadOutlined />} onClick={() => refetch()} loading={isLoading}>刷新</Button>
-          </Space>
+          <ClusterSelector clusters={clusters ?? []} value={dsId} onChange={select} />
         }
       />
       <SurfaceCard style={{ margin: '0 24px 24px' }}>
@@ -548,13 +545,16 @@ export default function K8sNodes() {
         {dsId && (
           <>
             <div style={{ marginBottom: 12 }}>
-              <Input.Search
-                placeholder="搜索节点名/IP"
-                allowClear
-                value={search}
-                onChange={e => setSearch(e.target.value)}
-                style={{ width: 260 }}
-              />
+              <Space>
+                <Input.Search
+                  placeholder="搜索节点名/IP"
+                  allowClear
+                  value={search}
+                  onChange={e => setSearch(e.target.value)}
+                  style={{ width: 260 }}
+                />
+                <Button icon={<ReloadOutlined />} onClick={() => refetch()} loading={isLoading}>刷新</Button>
+              </Space>
             </div>
             <Table
               dataSource={filteredNodes}

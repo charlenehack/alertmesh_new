@@ -635,7 +635,7 @@ function DeploymentsTab({ dsId }: { dsId: string }) {
         okText="确认"
       >
         <Form form={scaleForm} layout="vertical">
-          <Form.Item name="replicas" label="副本数" rules={[{ required: true, min: 0 }]}>
+          <Form.Item name="replicas" label="副本数" rules={[{ required: true, type: 'number', min: 0, max: 100 }]}>
             <InputNumber min={0} max={100} style={{ width: '100%' }} />
           </Form.Item>
         </Form>

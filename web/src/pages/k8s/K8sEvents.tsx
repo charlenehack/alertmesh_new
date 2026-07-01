@@ -179,10 +179,7 @@ export default function K8sEvents() {
           </Space>
         }
         extra={
-          <Space>
-            <ClusterSelector clusters={clusters ?? []} value={dsId} onChange={select} />
-            <Button icon={<ReloadOutlined />} onClick={() => refetch()} loading={isLoading}>刷新</Button>
-          </Space>
+          <ClusterSelector clusters={clusters ?? []} value={dsId} onChange={select} />
         }
       />
       <SurfaceCard style={{ margin: '0 24px 24px' }}>
@@ -198,6 +195,7 @@ export default function K8sEvents() {
             ]} />
           <Input.Search placeholder="搜索资源名/原因/消息" allowClear style={{ width: 260 }}
             onSearch={setSearch} onChange={e => !e.target.value && setSearch('')} />
+          <Button icon={<ReloadOutlined />} onClick={() => refetch()} loading={isLoading}>刷新</Button>
           <Space size={4}>
             <Switch size="small" checked={autoRefresh.enabled} onChange={autoRefresh.setEnabled} />
             <span style={{ fontSize: 12 }}>自动刷新</span>
