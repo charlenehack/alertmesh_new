@@ -746,7 +746,7 @@ const (
 
 // AnalyzeK8sRequest carries the metadata and raw text for a K8s AI analysis.
 type AnalyzeK8sRequest struct {
-	ResourceKind string          // Pod / Deployment / DaemonSet
+	ResourceKind string // Pod / Deployment / DaemonSet
 	Namespace    string
 	Name         string
 	AnalysisKind K8sAnalysisKind // "logs" or "events"
@@ -842,20 +842,27 @@ func streamAnthropicDirect(ctx context.Context, apiKey, baseURL, modelName, prom
 	}
 
 	scanner := bufio.NewScanner(resp.Body)
+	var eventCount, textCount, thinkingCount, otherCount, skipCount int
 	for scanner.Scan() {
 		line := scanner.Text()
-		if !strings.HasPrefix(line, "data: ") {
+		// Anthropic SSE lines may be "data: {...}" or "data:{...}" (no space)
+		var data string
+		if strings.HasPrefix(line, "data: ") {
+			data = line[6:]
+		} else if strings.HasPrefix(line, "data:") {
+			data = line[5:]
+		} else {
 			continue
 		}
-		data := line[6:] // strip "data: "
 		if data == "[DONE]" {
 			break
 		}
 		var event struct {
 			Type  string `json:"type"`
 			Delta struct {
-				Type string `json:"type"`
-				Text string `json:"text"`
+				Type     string `json:"type"`
+				Text     string `json:"text"`
+				Thinking string `json:"thinking"`
 			} `json:"delta"`
 			Error struct {
 				Type    string `json:"type"`
@@ -863,17 +870,35 @@ func streamAnthropicDirect(ctx context.Context, apiKey, baseURL, modelName, prom
 			} `json:"error"`
 		}
 		if err := json.Unmarshal([]byte(data), &event); err != nil {
+			skipCount++
 			continue // skip malformed / non-JSON events
 		}
+		eventCount++
 		switch event.Type {
 		case "content_block_delta":
-			if event.Delta.Type == "text_delta" && event.Delta.Text != "" {
-				onToken(event.Delta.Text)
+			switch event.Delta.Type {
+			case "text_delta":
+				if event.Delta.Text != "" {
+					textCount++
+					onToken(event.Delta.Text)
+				}
+			case "thinking_delta":
+				thinkingCount++
+			default:
+				otherCount++
 			}
 		case "error":
 			return fmt.Errorf("anthropic stream error: %s – %s", event.Error.Type, event.Error.Message)
 		}
 	}
+	log.Info().
+		Str("model", modelName).
+		Int("events", eventCount).
+		Int("text_deltas", textCount).
+		Int("thinking_deltas", thinkingCount).
+		Int("other_deltas", otherCount).
+		Int("skipped_lines", skipCount).
+		Msg("K8s AI analysis anthropic stream finished")
 	return scanner.Err()
 }
 

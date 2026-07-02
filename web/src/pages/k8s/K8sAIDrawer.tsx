@@ -93,7 +93,7 @@ export function K8sAIDrawer({
           if (!hasReceived) {
             ctrl.abort('AI 分析超时，响应时间过长，请重试')
           }
-        }, 120_000) // 120 秒超时
+        }, 300_000) // 300 秒超时（兼容 thinking 模型首 token 延迟）
 
         const pump = async (): Promise<void> => {
           const { done, value } = await reader.read()

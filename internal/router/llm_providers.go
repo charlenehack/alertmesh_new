@@ -31,16 +31,19 @@ package router
 //     inbound + outbound shaping goes through the DTOs below.
 
 import (
+	"bufio"
+	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"strings"
 	"time"
 
 	restful "github.com/emicklei/go-restful/v3"
 	"github.com/tmc/langchaingo/llms"
-	"github.com/tmc/langchaingo/llms/anthropic"
 	"github.com/tmc/langchaingo/llms/openai"
 	"gorm.io/gorm"
 
@@ -396,19 +399,22 @@ func (h *aiHandler) testLLMProvider(req *restful.Request, resp *restful.Response
 	var err error
 	switch provider.Provider {
 	case "anthropic":
-		baseURL := provider.BaseURL
-		if baseURL != "" && !strings.HasSuffix(baseURL, "/v1") {
-			baseURL = strings.TrimSuffix(baseURL, "/") + "/v1"
-		}
-		llm, err = anthropic.New(
-			anthropic.WithToken(apiKey),
-			anthropic.WithModel(provider.ModelName),
-			anthropic.WithBaseURL(baseURL),
-		)
+		// Use a direct HTTP call instead of langchaingo so we can skip
+		// "thinking" content blocks that some Anthropic-compatible proxies
+		// inject even for non-thinking model names.
+		anthropicCtx, cancel := context.WithTimeout(req.Request.Context(), 30*time.Second)
+		defer cancel()
+		sample, err := testAnthropicDirect(anthropicCtx, provider.BaseURL, apiKey, provider.ModelName)
 		if err != nil {
-			httputil.Error(resp, http.StatusBadGateway, "init anthropic LLM client: "+err.Error())
+			httputil.Error(resp, http.StatusBadGateway, "test call failed: "+err.Error())
 			return
 		}
+		httputil.Success(resp, map[string]any{
+			"ok":     true,
+			"model":  provider.ModelName,
+			"sample": sample,
+		})
+		return
 	default:
 		llmOpts := []openai.Option{
 			openai.WithToken(apiKey),
@@ -519,4 +525,85 @@ func (h *aiHandler) decryptAPIKey(stored string) (string, error) { //nolint:unpa
 		return stored, nil //nolint:nilerr
 	}
 	return plain, nil
+}
+
+// testAnthropicDirect calls the Anthropic Messages API directly, bypassing
+// langchaingo so that "thinking" content blocks returned by some proxies can
+// be ignored. The request is streamed so that we can return as soon as the
+// first text tokens arrive, instead of waiting for a long thinking block to
+// finish in non-streaming mode.
+func testAnthropicDirect(ctx context.Context, baseURL, apiKey, modelName string) (string, error) {
+	if baseURL == "" {
+		baseURL = "https://api.anthropic.com/v1"
+	} else {
+		baseURL = strings.TrimRight(baseURL, "/")
+		if !strings.HasSuffix(baseURL, "/v1") {
+			baseURL += "/v1"
+		}
+	}
+
+	body, _ := json.Marshal(map[string]interface{}{
+		"model":      modelName,
+		"max_tokens": 1024,
+		"stream":     true,
+		"messages": []map[string]interface{}{
+			{"role": "user", "content": "ping"},
+		},
+	})
+
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, baseURL+"/messages", bytes.NewReader(body))
+	if err != nil {
+		return "", fmt.Errorf("build request: %w", err)
+	}
+	httpReq.Header.Set("Content-Type", "application/json")
+	httpReq.Header.Set("x-api-key", apiKey)
+	httpReq.Header.Set("anthropic-version", "2023-06-01")
+
+	resp, err := http.DefaultClient.Do(httpReq)
+	if err != nil {
+		return "", fmt.Errorf("request: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		b, _ := io.ReadAll(io.LimitReader(resp.Body, 64*1024))
+		return "", fmt.Errorf("API error %d: %s", resp.StatusCode, string(b))
+	}
+
+	scanner := bufio.NewScanner(resp.Body)
+	var sample strings.Builder
+	for scanner.Scan() {
+		line := scanner.Text()
+		var data string
+		if strings.HasPrefix(line, "data: ") {
+			data = line[6:]
+		} else if strings.HasPrefix(line, "data:") {
+			data = line[5:]
+		} else {
+			continue
+		}
+		if data == "[DONE]" {
+			break
+		}
+		var event struct {
+			Type  string `json:"type"`
+			Delta struct {
+				Type string `json:"type"`
+				Text string `json:"text"`
+			} `json:"delta"`
+		}
+		if err := json.Unmarshal([]byte(data), &event); err != nil {
+			continue
+		}
+		if event.Type == "content_block_delta" && event.Delta.Type == "text_delta" {
+			sample.WriteString(event.Delta.Text)
+			if sample.Len() >= 20 {
+				break
+			}
+		}
+	}
+	if err := scanner.Err(); err != nil {
+		return "", fmt.Errorf("read stream: %w", err)
+	}
+	return strings.TrimSpace(sample.String()), nil
 }

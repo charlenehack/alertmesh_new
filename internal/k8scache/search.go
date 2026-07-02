@@ -36,7 +36,7 @@ func (cc *ClusterCache) SearchPods(params SearchParams) PaginateResult {
 		if !matchesNamespace(pod.Namespace, params.Namespace) {
 			continue
 		}
-		if !matchesSearch(pod.Name, params.Search) {
+		if !matchesSearch(pod.Name, params.Search) && !matchesSearch(pod.Status.PodIP, params.Search) {
 			continue
 		}
 		if params.NodeName != "" && !strings.Contains(

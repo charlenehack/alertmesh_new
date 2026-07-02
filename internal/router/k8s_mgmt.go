@@ -11,15 +11,15 @@ import (
 	"net"
 	"net/http"
 	"net/url"
-	"sort"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
 
-	"github.com/gorilla/websocket"
 	restful "github.com/emicklei/go-restful/v3"
+	"github.com/gorilla/websocket"
 	"golang.org/x/sync/errgroup"
 	"gorm.io/gorm"
 
@@ -307,10 +307,10 @@ func (h *k8sMgmtHandler) registerRoutes(ws *restful.WebService) {
 		To(h.globalEvents).
 		Doc("Get all events across namespaces (?ds=&namespace=&type=Warning|Normal)")))
 
-		// ── ResourceQuotas ──────────────────────────────────────────────────────
-		ws.Route(meta(ws.GET("/k8s/resourcequotas").
-			To(h.listResourceQuotas).
-			Doc("List resource quotas, optional ?namespace= filter")))
+	// ── ResourceQuotas ──────────────────────────────────────────────────────
+	ws.Route(meta(ws.GET("/k8s/resourcequotas").
+		To(h.listResourceQuotas).
+		Doc("List resource quotas, optional ?namespace= filter")))
 }
 
 // ─── cluster list ──────────────────────────────────────────────────────────────
@@ -697,28 +697,27 @@ func (h *k8sMgmtHandler) overview(req *restful.Request, resp *restful.Response) 
 	memRequestRate := rateOrNeg(totalCapMemKi-totalAllocMemKi, totalCapMemKi)
 
 	httputil.Success(resp, map[string]any{
-		"total_nodes":       totalNodes,
-		"ready_nodes":       readyNodes,
-		"namespace_count":   nsCount,
-		"pod_total":         podTotal,
-		"deployment_count":  deployCount,
-		"daemonset_count":   dsCount,
-		"statefulset_count": ssCount,
-		"cap_cpu_m":         totalCapCPUm,
-		"cap_mem_ki":        totalCapMemKi,
-		"alloc_cpu_m":       totalAllocCPUm,
-		"alloc_mem_ki":      totalAllocMemKi,
-		"usage_cpu_m":       totalUsageCPUm,
-		"usage_mem_ki":      totalUsageMemKi,
-		"cpu_usage_rate":    cpuUsageRate,
-		"mem_usage_rate":    memUsageRate,
-		"cpu_request_rate":  cpuRequestRate,
-		"mem_request_rate":  memRequestRate,
-		"metrics_available":     metricsAvailable,
+		"total_nodes":             totalNodes,
+		"ready_nodes":             readyNodes,
+		"namespace_count":         nsCount,
+		"pod_total":               podTotal,
+		"deployment_count":        deployCount,
+		"daemonset_count":         dsCount,
+		"statefulset_count":       ssCount,
+		"cap_cpu_m":               totalCapCPUm,
+		"cap_mem_ki":              totalCapMemKi,
+		"alloc_cpu_m":             totalAllocCPUm,
+		"alloc_mem_ki":            totalAllocMemKi,
+		"usage_cpu_m":             totalUsageCPUm,
+		"usage_mem_ki":            totalUsageMemKi,
+		"cpu_usage_rate":          cpuUsageRate,
+		"mem_usage_rate":          memUsageRate,
+		"cpu_request_rate":        cpuRequestRate,
+		"mem_request_rate":        memRequestRate,
+		"metrics_available":       metricsAvailable,
 		"pod_status_distribution": podStatusDistribution,
 	})
 }
-
 
 // parseSearchParams extracts common search/pagination params from the request.
 func parseSearchParams(req *restful.Request) k8scache.SearchParams {
@@ -923,8 +922,8 @@ func (h *k8sMgmtHandler) clusterSummary(req *restful.Request, resp *restful.Resp
 
 	// --- parse nodes ---
 	totalNodes, readyNodes := 0, 0
-	var totalAllocCPUm, totalAllocMemKi int64      // allocatable
-	var totalCapCPUm, totalCapMemKi int64           // capacity
+	var totalAllocCPUm, totalAllocMemKi int64 // allocatable
+	var totalCapCPUm, totalCapMemKi int64     // capacity
 
 	if items, ok := nodeList["items"].([]any); ok {
 		for _, item := range items {
@@ -987,7 +986,7 @@ func (h *k8sMgmtHandler) clusterSummary(req *restful.Request, resp *restful.Resp
 		"cap_mem_ki":        totalCapMemKi,
 		"usage_cpu_m":       totalUsageCPUm,
 		"usage_mem_ki":      totalUsageMemKi,
-		"cpu_usage_rate":    cpuUsageRate,    // -1 = metrics-server not available
+		"cpu_usage_rate":    cpuUsageRate, // -1 = metrics-server not available
 		"mem_usage_rate":    memUsageRate,
 		"cpu_request_rate":  rateOrNeg(totalCapCPUm-totalAllocCPUm, totalCapCPUm),
 		"mem_request_rate":  rateOrNeg(totalCapMemKi-totalAllocMemKi, totalCapMemKi),
@@ -1070,15 +1069,23 @@ func (h *k8sMgmtHandler) clusterDetail(req *restful.Request, resp *restful.Respo
 	fetch := func(path string) (map[string]any, error) {
 		u := baseURL + path
 		r, e := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
-		if e != nil { return nil, e }
-		if token != "" { r.Header.Set("Authorization", "Bearer "+token) }
+		if e != nil {
+			return nil, e
+		}
+		if token != "" {
+			r.Header.Set("Authorization", "Bearer "+token)
+		}
 		r.Header.Set("Accept", "application/json")
 		res, e := client.Do(r)
-		if e != nil { return nil, e }
+		if e != nil {
+			return nil, e
+		}
 		defer func() { _ = res.Body.Close() }()
 		body, _ := io.ReadAll(io.LimitReader(res.Body, 32*1024*1024))
 		out := map[string]any{}
-		if e := json.Unmarshal(body, &out); e != nil { return nil, e }
+		if e := json.Unmarshal(body, &out); e != nil {
+			return nil, e
+		}
 		return out, nil
 	}
 
@@ -1117,15 +1124,17 @@ func (h *k8sMgmtHandler) clusterDetail(req *restful.Request, resp *restful.Respo
 				if conds, _ := status["conditions"].([]any); conds != nil {
 					for _, c := range conds {
 						cond, _ := c.(map[string]any)
-						if cond["type"] == "Ready" && cond["status"] == "True" { readyNodes++ }
+						if cond["type"] == "Ready" && cond["status"] == "True" {
+							readyNodes++
+						}
 					}
 				}
 				if cap, _ := status["capacity"].(map[string]any); cap != nil {
-					capCPUm  += parseCPUm(fmt.Sprintf("%v", cap["cpu"]))
+					capCPUm += parseCPUm(fmt.Sprintf("%v", cap["cpu"]))
 					capMemKi += parseMemKi(fmt.Sprintf("%v", cap["memory"]))
 				}
 				if alloc, _ := status["allocatable"].(map[string]any); alloc != nil {
-					allocCPUm  += parseCPUm(fmt.Sprintf("%v", alloc["cpu"]))
+					allocCPUm += parseCPUm(fmt.Sprintf("%v", alloc["cpu"]))
 					allocMemKi += parseMemKi(fmt.Sprintf("%v", alloc["memory"]))
 				}
 			}
@@ -1137,7 +1146,7 @@ func (h *k8sMgmtHandler) clusterDetail(req *restful.Request, resp *restful.Respo
 		for _, item := range items {
 			m, _ := item.(map[string]any)
 			if usage, _ := m["usage"].(map[string]any); usage != nil {
-				usageCPUm  += parseCPUm(fmt.Sprintf("%v", usage["cpu"]))
+				usageCPUm += parseCPUm(fmt.Sprintf("%v", usage["cpu"]))
 				usageMemKi += parseMemKi(fmt.Sprintf("%v", usage["memory"]))
 			}
 		}
@@ -1175,11 +1184,11 @@ func (h *k8sMgmtHandler) clusterDetail(req *restful.Request, resp *restful.Respo
 				cm, _ := ct.(map[string]any)
 				res, _ := cm["resources"].(map[string]any)
 				if req, _ := res["requests"].(map[string]any); req != nil {
-					reqCPUm  += parseCPUm(fmt.Sprintf("%v", req["cpu"]))
+					reqCPUm += parseCPUm(fmt.Sprintf("%v", req["cpu"]))
 					reqMemKi += parseMemKi(fmt.Sprintf("%v", req["memory"]))
 				}
 				if lim, _ := res["limits"].(map[string]any); lim != nil {
-					limCPUm  += parseCPUm(fmt.Sprintf("%v", lim["cpu"]))
+					limCPUm += parseCPUm(fmt.Sprintf("%v", lim["cpu"]))
 					limMemKi += parseMemKi(fmt.Sprintf("%v", lim["memory"]))
 				}
 			}
@@ -1193,8 +1202,8 @@ func (h *k8sMgmtHandler) clusterDetail(req *restful.Request, resp *restful.Respo
 		"created_at":  row.CreatedAt,
 		"is_enabled":  row.IsEnabled,
 		// nodes
-		"total_nodes":  totalNodes,
-		"ready_nodes":  readyNodes,
+		"total_nodes": totalNodes,
+		"ready_nodes": readyNodes,
 		// pods
 		"total_pods":   totalPods,
 		"pod_capacity": podCapacity,
@@ -1346,7 +1355,9 @@ func (h *k8sMgmtHandler) scaleDeployment(req *restful.Request, resp *restful.Res
 	}
 	body, _ := io.ReadAll(io.LimitReader(req.Request.Body, 64*1024))
 	// body: {"replicas": N}  → merge-patch on scale sub-resource
-	var in struct{ Replicas *int32 `json:"replicas"` }
+	var in struct {
+		Replicas *int32 `json:"replicas"`
+	}
 	if err := json.Unmarshal(body, &in); err != nil || in.Replicas == nil {
 		httputil.BadRequest(resp, "请传入 {\"replicas\": N}")
 		return
@@ -1625,7 +1636,9 @@ func (h *k8sMgmtHandler) podExec(req *restful.Request, resp *restful.Response) {
 		return
 	}
 
-	var body struct{ Command string `json:"command"` }
+	var body struct {
+		Command string `json:"command"`
+	}
 	if err := req.ReadEntity(&body); err != nil || body.Command == "" {
 		httputil.BadRequest(resp, "缺少 command 参数")
 		return
@@ -1662,7 +1675,7 @@ func (h *k8sMgmtHandler) podExec(req *restful.Request, resp *restful.Response) {
 	}
 
 	dialer := websocket.Dialer{
-		TLSClientConfig: &tls.Config{InsecureSkipVerify: tlsSkip}, //nolint:gosec
+		TLSClientConfig:  &tls.Config{InsecureSkipVerify: tlsSkip}, //nolint:gosec
 		HandshakeTimeout: 10 * time.Second,
 	}
 
@@ -1865,7 +1878,9 @@ func (h *k8sMgmtHandler) resizePVC(req *restful.Request, resp *restful.Response)
 		return
 	}
 	body, _ := io.ReadAll(io.LimitReader(req.Request.Body, 64*1024))
-	var in struct{ Storage string `json:"storage"` }
+	var in struct {
+		Storage string `json:"storage"`
+	}
 	if err := json.Unmarshal(body, &in); err != nil || in.Storage == "" {
 		httputil.BadRequest(resp, "请传入 {\"storage\": \"20Gi\"}")
 		return
@@ -1987,7 +2002,13 @@ func (h *k8sMgmtHandler) listHPAs(req *restful.Request, resp *restful.Response) 
 		httputil.Success(resp, map[string]any{"items": []any{}, "metadata": map[string]any{}})
 		return
 	}
-	h.proxyK8s(req, resp, path)
+
+	dsID := req.QueryParameter("ds")
+	params := parseSearchParams(req)
+	result, err := h.cacheMgr.SearchGeneric(dsID, k8scache.ResHPAs, params)
+	h.cacheResultOrProxy(req, resp, dsID, result, err, func() {
+		h.proxyK8s(req, resp, path)
+	})
 }
 
 func (h *k8sMgmtHandler) hpaVersionPath(req *restful.Request, ns, name string) string {
@@ -2209,7 +2230,9 @@ func (h *k8sMgmtHandler) podTerminal(req *restful.Request, resp *restful.Respons
 		if k8sHResp != nil && k8sHResp.Body != nil {
 			b, _ := io.ReadAll(io.LimitReader(k8sHResp.Body, 64*1024))
 			_ = k8sHResp.Body.Close()
-			if len(b) > 0 { msg += " — " + string(b) }
+			if len(b) > 0 {
+				msg += " — " + string(b)
+			}
 		}
 		httputil.InternalError(resp, "K8s exec 连接失败: "+msg)
 		return
@@ -2233,8 +2256,12 @@ func (h *k8sMgmtHandler) podTerminal(req *restful.Request, resp *restful.Respons
 		defer cancel()
 		for {
 			_, msg, err := k8sConn.ReadMessage()
-			if err != nil { return }
-			if err := clientConn.WriteMessage(websocket.BinaryMessage, msg); err != nil { return }
+			if err != nil {
+				return
+			}
+			if err := clientConn.WriteMessage(websocket.BinaryMessage, msg); err != nil {
+				return
+			}
 		}
 	}()
 
@@ -2243,8 +2270,12 @@ func (h *k8sMgmtHandler) podTerminal(req *restful.Request, resp *restful.Respons
 		defer cancel()
 		for {
 			_, msg, err := clientConn.ReadMessage()
-			if err != nil { return }
-			if err := k8sConn.WriteMessage(websocket.BinaryMessage, msg); err != nil { return }
+			if err != nil {
+				return
+			}
+			if err := k8sConn.WriteMessage(websocket.BinaryMessage, msg); err != nil {
+				return
+			}
 		}
 	}()
 
@@ -2302,7 +2333,9 @@ func (h *k8sMgmtHandler) podFileUpload(req *restful.Request, resp *restful.Respo
 	}
 
 	wsScheme := "wss"
-	if strings.HasPrefix(baseURL, "http://") { wsScheme = "ws" }
+	if strings.HasPrefix(baseURL, "http://") {
+		wsScheme = "ws"
+	}
 	wsURL := strings.Replace(baseURL, "https://", wsScheme+"://", 1)
 	wsURL = strings.Replace(wsURL, "http://", wsScheme+"://", 1)
 
@@ -2324,7 +2357,9 @@ func (h *k8sMgmtHandler) podFileUpload(req *restful.Request, resp *restful.Respo
 		Subprotocols:     []string{"channel.k8s.io"},
 	}
 	headers := http.Header{}
-	if token != "" { headers.Set("Authorization", "Bearer "+token) }
+	if token != "" {
+		headers.Set("Authorization", "Bearer "+token)
+	}
 	wsConn, _, err := dialer.Dial(wsURL, headers)
 	if err != nil {
 		httputil.InternalError(resp, "上传失败: "+err.Error())
@@ -2342,7 +2377,9 @@ func (h *k8sMgmtHandler) podFileUpload(req *restful.Request, resp *restful.Respo
 	wsConn.SetReadDeadline(time.Now().Add(30 * time.Second))
 	for {
 		_, msg, err := wsConn.ReadMessage()
-		if err != nil { break }
+		if err != nil {
+			break
+		}
 		if len(msg) > 1 && msg[0] == 2 {
 			errOut.Write(msg[1:])
 		}
@@ -2376,7 +2413,9 @@ func (h *k8sMgmtHandler) podFileDownload(req *restful.Request, resp *restful.Res
 	}
 
 	wsScheme := "wss"
-	if strings.HasPrefix(baseURL, "http://") { wsScheme = "ws" }
+	if strings.HasPrefix(baseURL, "http://") {
+		wsScheme = "ws"
+	}
 	wsURL := strings.Replace(baseURL, "https://", wsScheme+"://", 1)
 	wsURL = strings.Replace(wsURL, "http://", wsScheme+"://", 1)
 
@@ -2397,7 +2436,9 @@ func (h *k8sMgmtHandler) podFileDownload(req *restful.Request, resp *restful.Res
 		Subprotocols:     []string{"channel.k8s.io"},
 	}
 	headers := http.Header{}
-	if token != "" { headers.Set("Authorization", "Bearer "+token) }
+	if token != "" {
+		headers.Set("Authorization", "Bearer "+token)
+	}
 	wsConn, _, err := dialer.Dial(wsURL, headers)
 	if err != nil {
 		httputil.InternalError(resp, "下载失败: "+err.Error())
@@ -2409,7 +2450,9 @@ func (h *k8sMgmtHandler) podFileDownload(req *restful.Request, resp *restful.Res
 	wsConn.SetReadDeadline(time.Now().Add(30 * time.Second))
 	for {
 		_, msg, err := wsConn.ReadMessage()
-		if err != nil { break }
+		if err != nil {
+			break
+		}
 		if len(msg) > 1 && msg[0] == 1 { // stdout
 			tarData.Write(msg[1:])
 		}
@@ -2419,7 +2462,9 @@ func (h *k8sMgmtHandler) podFileDownload(req *restful.Request, resp *restful.Res
 	tr := tar.NewReader(&tarData)
 	for {
 		_, err := tr.Next()
-		if err == io.EOF { break }
+		if err == io.EOF {
+			break
+		}
 		if err != nil {
 			httputil.InternalError(resp, "解析tar失败: "+err.Error())
 			return
@@ -2488,7 +2533,6 @@ func (h *k8sMgmtHandler) k8sAIAnalyze(req *restful.Request, resp *restful.Respon
 		flusher.Flush()
 	}
 }
-
 
 // ─── Rollback common types and helpers ──────────────────────────────────────────
 
@@ -2695,7 +2739,9 @@ func (h *k8sMgmtHandler) listDeploymentHistory(req *restful.Request, resp *restf
 	var enriched []historyEntry
 	data, status, _ := h.k8sWriteReq(ctx, client, baseURL, token, http.MethodGet, rsPath, "", nil)
 	if status < 400 {
-		var list struct{ Items []json.RawMessage `json:"items"` }
+		var list struct {
+			Items []json.RawMessage `json:"items"`
+		}
 		if json.Unmarshal(data, &list) == nil {
 			for _, raw := range list.Items {
 				var rs rsFull
@@ -2984,6 +3030,7 @@ func (h *k8sMgmtHandler) rollbackDaemonSet(req *restful.Request, resp *restful.R
 	h.patchWorkloadTemplate(req, resp,
 		"/apis/apps/v1/namespaces/"+ns+"/daemonsets/"+name, template)
 }
+
 // podDescribe assembles a kubectl-describe-style summary for a single pod:
 // pod detail + related events, returned as a structured JSON object.
 func (h *k8sMgmtHandler) podDescribe(req *restful.Request, resp *restful.Response) {

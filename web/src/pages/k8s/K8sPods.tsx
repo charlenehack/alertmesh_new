@@ -375,7 +375,7 @@ function PodsTab({ dsId, selectorFilter = '', nsFilter = '', nodeFilterProp = ''
           onChange={v => { setNs(v ?? ''); clearFiltersFromUserAction() }}
           options={namespaces.map(n => ({ label: n, value: n }))}
         />
-        <Input.Search placeholder="搜索 Pod 名称" allowClear style={{ width: 200 }}
+        <Input.Search placeholder="搜索 Pod 名称 / IP" allowClear style={{ width: 220 }}
           onSearch={doSearch} onChange={e => !e.target.value && doSearch('')} />
         <Select style={{ width: 160 }} placeholder="状态" allowClear value={phase || undefined}
           onChange={v => { setPhase(v ?? ''); clearFiltersFromUserAction() }}
