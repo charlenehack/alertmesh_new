@@ -280,6 +280,52 @@ func (cc *ClusterCache) ListNodesRaw() []*corev1.Node {
 	return nodes
 }
 
+// PodCountsPerNode returns the number of running/non-terminating pods
+// scheduled on each node, keyed by node name.
+func (cc *ClusterCache) PodCountsPerNode() map[string]int {
+	counts := make(map[string]int)
+	for _, pod := range cc.ListPodsRaw() {
+		if pod.Spec.NodeName == "" {
+			continue
+		}
+		// Ignore pods that are being deleted or already succeeded/failed and not terminating
+		phase := string(pod.Status.Phase)
+		if pod.DeletionTimestamp != nil || phase == "Succeeded" || phase == "Failed" {
+			continue
+		}
+		counts[pod.Spec.NodeName]++
+	}
+	return counts
+}
+
+// PodResourceSummary returns the total number of non-terminated pods and the
+// aggregate CPU/memory requests/limits across all containers.
+// Pods in Succeeded or Failed phases are excluded to match kubectl semantics.
+func (cc *ClusterCache) PodResourceSummary() (totalPods int, reqCPUm, reqMemKi, limCPUm, limMemKi int64) {
+	for _, pod := range cc.ListPodsRaw() {
+		phase := string(pod.Status.Phase)
+		if phase == "Succeeded" || phase == "Failed" {
+			continue
+		}
+		totalPods++
+		for _, c := range pod.Spec.Containers {
+			if cpu := c.Resources.Requests.Cpu(); cpu != nil {
+				reqCPUm += cpu.MilliValue()
+			}
+			if mem := c.Resources.Requests.Memory(); mem != nil {
+				reqMemKi += mem.Value() / 1024
+			}
+			if cpu := c.Resources.Limits.Cpu(); cpu != nil {
+				limCPUm += cpu.MilliValue()
+			}
+			if mem := c.Resources.Limits.Memory(); mem != nil {
+				limMemKi += mem.Value() / 1024
+			}
+		}
+	}
+	return
+}
+
 func toJSON(obj any) map[string]any {
 	data, err := json.Marshal(obj)
 	if err != nil {
@@ -305,11 +351,11 @@ func matchesNamespace(objNS, filterNS string) bool {
 }
 
 type PaginateResult struct {
-	Items            []map[string]any `json:"items"`
-	Total            int              `json:"total"`
-	Page             int              `json:"page"`
-	PageSize         int              `json:"pageSize"`
-	AvailableStatuses []string        `json:"availableStatuses,omitempty"`
+	Items             []map[string]any `json:"items"`
+	Total             int              `json:"total"`
+	Page              int              `json:"page"`
+	PageSize          int              `json:"pageSize"`
+	AvailableStatuses []string         `json:"availableStatuses,omitempty"`
 }
 
 func paginate(items []map[string]any, page, pageSize int) PaginateResult {

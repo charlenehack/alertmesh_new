@@ -46,6 +46,8 @@ interface OverviewData {
   alloc_mem_ki: number
   usage_cpu_m: number
   usage_mem_ki: number
+  req_cpu_m: number
+  req_mem_ki: number
   cpu_usage_rate: number
   mem_usage_rate: number
   cpu_request_rate: number
@@ -265,16 +267,16 @@ export default function K8sOverview() {
               <Col xs={24} sm={12} md={6}>
                 <RingGauge
                   value={data.cpu_request_rate}
-                  label="CPU 分配率"
-                  detail={`已分配 ${fmtCpu(data.alloc_cpu_m)} / 总量 ${fmtCpu(data.cap_cpu_m)}`}
+                  label="CPU 申请率"
+                  detail={`已申请 ${fmtCpu(data.req_cpu_m)} / 可分配 ${fmtCpu(data.alloc_cpu_m)}`}
                   colorMap={usageColor}
                 />
               </Col>
               <Col xs={24} sm={12} md={6}>
                 <RingGauge
                   value={data.mem_request_rate}
-                  label="内存分配率"
-                  detail={`已分配 ${fmtMem(data.alloc_mem_ki)} / 总量 ${fmtMem(data.cap_mem_ki)}`}
+                  label="内存申请率"
+                  detail={`已申请 ${fmtMem(data.req_mem_ki)} / 可分配 ${fmtMem(data.alloc_mem_ki)}`}
                   colorMap={usageColor}
                 />
               </Col>
@@ -322,8 +324,12 @@ export default function K8sOverview() {
                     <ResourceRow label="内存可分配" value={fmtMem(data.alloc_mem_ki)} />
                     <ResourceRow label="CPU 使用" value={data.metrics_available ? fmtCpu(data.usage_cpu_m) : 'N/A'} />
                     <ResourceRow label="内存使用" value={data.metrics_available ? fmtMem(data.usage_mem_ki) : 'N/A'} />
+                    <ResourceRow label="CPU 申请" value={fmtCpu(data.req_cpu_m)} />
+                    <ResourceRow label="内存申请" value={fmtMem(data.req_mem_ki)} />
                     <ResourceRow label="CPU 使用率" value={data.cpu_usage_rate >= 0 ? `${data.cpu_usage_rate.toFixed(1)}%` : 'N/A'} highlight />
                     <ResourceRow label="内存使用率" value={data.mem_usage_rate >= 0 ? `${data.mem_usage_rate.toFixed(1)}%` : 'N/A'} highlight />
+                    <ResourceRow label="CPU 申请率" value={data.cpu_request_rate >= 0 ? `${data.cpu_request_rate.toFixed(1)}%` : 'N/A'} highlight />
+                    <ResourceRow label="内存申请率" value={data.mem_request_rate >= 0 ? `${data.mem_request_rate.toFixed(1)}%` : 'N/A'} highlight />
                   </div>
                 </SurfaceCard>
               </Col>

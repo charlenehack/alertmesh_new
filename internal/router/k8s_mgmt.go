@@ -137,6 +137,9 @@ func (h *k8sMgmtHandler) registerRoutes(ws *restful.WebService) {
 	ws.Route(meta(ws.DELETE("/k8s/node").
 		To(h.deleteNode).
 		Doc("Delete a node from the cluster")))
+	ws.Route(meta(ws.GET("/k8s/nodes/pod-counts").
+		To(h.podCountsPerNode).
+		Doc("Running pod count per node")))
 
 	// ── Deployments ─────────────────────────────────────────────────────────
 	ws.Route(meta(ws.GET("/k8s/deployments").
@@ -693,8 +696,15 @@ func (h *k8sMgmtHandler) overview(req *restful.Request, resp *restful.Response) 
 
 	cpuUsageRate := rateOrNeg(totalUsageCPUm, totalCapCPUm)
 	memUsageRate := rateOrNeg(totalUsageMemKi, totalCapMemKi)
-	cpuRequestRate := rateOrNeg(totalCapCPUm-totalAllocCPUm, totalCapCPUm)
-	memRequestRate := rateOrNeg(totalCapMemKi-totalAllocMemKi, totalCapMemKi)
+
+	// Use cached pod requests for the request rate so it reflects actual workload
+	// allocation rather than the static (capacity - allocatable) system reserve.
+	var reqCPUm, reqMemKi int64
+	if _, rCPU, rMem, _, _, err := h.cacheMgr.PodResourceSummary(dsID); err == nil {
+		reqCPUm, reqMemKi = rCPU, rMem
+	}
+	cpuRequestRate := rateOrNeg(reqCPUm, totalAllocCPUm)
+	memRequestRate := rateOrNeg(reqMemKi, totalAllocMemKi)
 
 	httputil.Success(resp, map[string]any{
 		"total_nodes":             totalNodes,
@@ -710,6 +720,8 @@ func (h *k8sMgmtHandler) overview(req *restful.Request, resp *restful.Response) 
 		"alloc_mem_ki":            totalAllocMemKi,
 		"usage_cpu_m":             totalUsageCPUm,
 		"usage_mem_ki":            totalUsageMemKi,
+		"req_cpu_m":               reqCPUm,
+		"req_mem_ki":              reqMemKi,
 		"cpu_usage_rate":          cpuUsageRate,
 		"mem_usage_rate":          memUsageRate,
 		"cpu_request_rate":        cpuRequestRate,
@@ -977,6 +989,13 @@ func (h *k8sMgmtHandler) clusterSummary(req *restful.Request, resp *restful.Resp
 		memUsageRate = float64(totalUsageMemKi) / float64(totalCapMemKi) * 100
 	}
 
+	// Use cached pod requests for the request rate so it reflects actual workload
+	// allocation rather than the static (capacity - allocatable) system reserve.
+	var reqCPUm, reqMemKi int64
+	if _, rCPU, rMem, _, _, err := h.cacheMgr.PodResourceSummary(dsID); err == nil {
+		reqCPUm, reqMemKi = rCPU, rMem
+	}
+
 	httputil.Success(resp, map[string]any{
 		"total_nodes":       totalNodes,
 		"ready_nodes":       readyNodes,
@@ -986,10 +1005,12 @@ func (h *k8sMgmtHandler) clusterSummary(req *restful.Request, resp *restful.Resp
 		"cap_mem_ki":        totalCapMemKi,
 		"usage_cpu_m":       totalUsageCPUm,
 		"usage_mem_ki":      totalUsageMemKi,
+		"req_cpu_m":         reqCPUm,
+		"req_mem_ki":        reqMemKi,
 		"cpu_usage_rate":    cpuUsageRate, // -1 = metrics-server not available
 		"mem_usage_rate":    memUsageRate,
-		"cpu_request_rate":  rateOrNeg(totalCapCPUm-totalAllocCPUm, totalCapCPUm),
-		"mem_request_rate":  rateOrNeg(totalCapMemKi-totalAllocMemKi, totalCapMemKi),
+		"cpu_request_rate":  rateOrNeg(reqCPUm, totalAllocCPUm),
+		"mem_request_rate":  rateOrNeg(reqMemKi, totalAllocMemKi),
 		"metrics_available": metricsAvailable,
 		"nodes_status":      nodesStatus, // 节点 API 返回的 HTTP 状态码，0 表示请求失败
 	})
@@ -1168,7 +1189,12 @@ func (h *k8sMgmtHandler) clusterDetail(req *restful.Request, resp *restful.Respo
 			}
 		}
 	}
-	if items, ok := podList["items"].([]any); ok {
+
+	// Prefer cache for accurate pod count and resource totals (no 500-item API limit).
+	// Fall back to the API response if the cache is not ready.
+	if cc := h.cacheMgr.GetCache(dsID); cc != nil && cc.Ready() {
+		totalPods, reqCPUm, reqMemKi, limCPUm, limMemKi = cc.PodResourceSummary()
+	} else if items, ok := podList["items"].([]any); ok {
 		for _, item := range items {
 			p, _ := item.(map[string]any)
 			if phase, _ := func() (string, bool) {
@@ -2118,6 +2144,16 @@ func (h *k8sMgmtHandler) deleteNode(req *restful.Request, resp *restful.Response
 	h.doWrite(req, resp, http.MethodDelete,
 		"/api/v1/nodes/"+name,
 		"", nil)
+}
+
+func (h *k8sMgmtHandler) podCountsPerNode(req *restful.Request, resp *restful.Response) {
+	dsID := req.QueryParameter("ds")
+	counts, err := h.cacheMgr.PodCountsPerNode(dsID)
+	if err != nil {
+		httputil.BadRequest(resp, err.Error())
+		return
+	}
+	httputil.Success(resp, counts)
 }
 
 // ── Endpoints ────────────────────────────────────────────────────────────────────

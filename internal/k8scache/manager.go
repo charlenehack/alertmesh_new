@@ -177,6 +177,31 @@ func (m *Manager) PodStatusCounts(dsID string) (map[string]int, error) {
 	return cache.PodStatusCounts(), nil
 }
 
+// PodCountsPerNode returns the number of running/non-terminating pods per node.
+func (m *Manager) PodCountsPerNode(dsID string) (map[string]int, error) {
+	cache := m.GetCache(dsID)
+	if cache == nil {
+		return nil, fmt.Errorf("cluster %s not cached", dsID)
+	}
+	if !cache.Ready() {
+		return nil, fmt.Errorf("cluster %s cache not ready yet", dsID)
+	}
+	return cache.PodCountsPerNode(), nil
+}
+
+// PodResourceSummary returns aggregate pod count and resource requests/limits.
+func (m *Manager) PodResourceSummary(dsID string) (int, int64, int64, int64, int64, error) {
+	cache := m.GetCache(dsID)
+	if cache == nil {
+		return 0, 0, 0, 0, 0, fmt.Errorf("cluster %s not cached", dsID)
+	}
+	if !cache.Ready() {
+		return 0, 0, 0, 0, 0, fmt.Errorf("cluster %s cache not ready yet", dsID)
+	}
+	totalPods, reqCPUm, reqMemKi, limCPUm, limMemKi := cache.PodResourceSummary()
+	return totalPods, reqCPUm, reqMemKi, limCPUm, limMemKi, nil
+}
+
 // Shutdown stops all cluster caches.
 func (m *Manager) Shutdown(ctx context.Context) {
 	m.mu.Lock()

@@ -354,6 +354,14 @@ export default function K8sNodes() {
     refetchInterval: 30_000,
   })
 
+  const { data: podCounts } = useQuery<Record<string, number>>({
+    queryKey: ['k8s-nodes-pod-counts', dsId],
+    queryFn: () => http.get<Record<string, number>>('/k8s/nodes/pod-counts', { params: { ds: dsId } }),
+    enabled: !!dsId,
+    staleTime: 15_000,
+    refetchInterval: 30_000,
+  })
+
   const filteredNodes = useMemo(() => {
     const items = data?.items ?? []
     if (!search) return items
@@ -419,6 +427,19 @@ export default function K8sNodes() {
       render: (_: unknown, n: NodeItem) => (
         <span style={{ fontSize: 12, fontFamily: 'monospace', color: c.textSecondary }}>{nodeInternalIP(n)}</span>
       ),
+    },
+    {
+      title: 'Pod 数', width: 80,
+      render: (_: unknown, n: NodeItem) => {
+        const name = n.metadata?.name ?? ''
+        const count = podCounts?.[name] ?? 0
+        return (
+          <Button size="small" type="link" style={{ padding: 0, fontSize: 12, fontFamily: 'monospace' }}
+            onClick={() => navigate(`/k8s/resources?tab=pods&node=${encodeURIComponent(name)}`)}>
+            {count}
+          </Button>
+        )
+      },
     },
     {
       title: '标签', width: 220,
