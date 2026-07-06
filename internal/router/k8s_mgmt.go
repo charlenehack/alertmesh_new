@@ -2403,9 +2403,22 @@ func (h *k8sMgmtHandler) podFileUpload(req *restful.Request, resp *restful.Respo
 	}
 	defer wsConn.Close()
 
-	// channel 0 = stdin
-	stdinMsg := append([]byte{0}, tarData.Bytes()...)
-	_ = wsConn.WriteMessage(websocket.BinaryMessage, stdinMsg)
+	// channel 0 = stdin, 分块发送避免 K8s exec WebSocket 单消息大小限制
+	const chunkSize = 8 * 1024
+	tarBytes := tarData.Bytes()
+	for off := 0; off < len(tarBytes); off += chunkSize {
+		end := off + chunkSize
+		if end > len(tarBytes) {
+			end = len(tarBytes)
+		}
+		chunk := make([]byte, 1+len(tarBytes[off:end]))
+		chunk[0] = 0 // channel 0
+		copy(chunk[1:], tarBytes[off:end])
+		if err := wsConn.WriteMessage(websocket.BinaryMessage, chunk); err != nil {
+			httputil.InternalError(resp, "上传分块失败: "+err.Error())
+			return
+		}
+	}
 	// send close on channel 0
 	_ = wsConn.WriteMessage(websocket.BinaryMessage, []byte{0})
 

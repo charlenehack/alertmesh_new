@@ -1531,8 +1531,23 @@ function PodTerminalDrawer({
         ws.onerror = () => { if (!destroyedRef.current) term.write('\r\n\x1b[31m[连接失败，请点重连]\x1b[0m\r\n') }
 
         term.onData((data) => {
-          if (ws.readyState === WebSocket.OPEN)
-            ws.send(new Uint8Array([0, ...new TextEncoder().encode(data)]).buffer)
+          if (ws.readyState !== WebSocket.OPEN) return
+          const encoded = new TextEncoder().encode(data)
+          const CHUNK = 256
+          if (encoded.length <= CHUNK) {
+            ws.send(new Uint8Array([0, ...encoded]).buffer)
+            return
+          }
+          // Large paste (e.g. vim 粘贴): 分块发送避免 PTY 输入队列溢出
+          let offset = 0
+          const sendChunk = () => {
+            if (offset >= encoded.length || ws.readyState !== WebSocket.OPEN) return
+            const end = Math.min(offset + CHUNK, encoded.length)
+            ws.send(new Uint8Array([0, ...encoded.slice(offset, end)]).buffer)
+            offset = end
+            if (offset < encoded.length) setTimeout(sendChunk, 10)
+          }
+          sendChunk()
         })
 
         term.onResize(({ cols, rows }) => {
