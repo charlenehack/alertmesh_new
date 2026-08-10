@@ -111,7 +111,7 @@ export default function IncidentDetail() {
         const msg = JSON.parse(event.data) as { type?: string; content?: string }
         if (typeof msg.type === 'string' && typeof msg.content === 'string') {
           setWsMessages((prev) => [...prev, { type: msg.type!, content: msg.content! }])
-          if (msg.type === 'analysis_done') {
+          if (msg.type === 'analysis_done' || msg.type === 'analysis_error') {
             refetchAI()
             qc.invalidateQueries({ queryKey: ['incident', id] })
           }

@@ -211,6 +211,11 @@ export default function AppLayout() {
           icon: <BellOutlined />,
           label: '告警事件',
           onClick: () => navigate('/incidents'),
+        }, {
+          key: '/alert/reports',
+          icon: <FileTextOutlined />,
+          label: '告警报告',
+          onClick: () => navigate('/alert/reports'),
         }] : []),
         ...(canAlertRoute ? [{
           key: '/alert/routes',

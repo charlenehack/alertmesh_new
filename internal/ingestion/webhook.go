@@ -22,6 +22,16 @@ type WebhookMapping struct {
 	StartsAtPath    string            `json:"starts_at_path,omitempty"`
 	FingerprintPath string            `json:"fingerprint_path,omitempty"`
 	LabelPaths      map[string]string `json:"label_paths,omitempty"`
+
+	// StatusPath maps a JSON field to alert status (firing/resolved).
+	// When empty, all alerts default to "firing".
+	StatusPath          string `json:"status_path,omitempty"`
+	StatusFiringValue   string `json:"status_firing_value,omitempty"`   // value meaning "firing" (default: "firing", "1")
+	StatusResolvedValue string `json:"status_resolved_value,omitempty"` // value meaning "resolved" (default: "resolved", "0")
+
+	// DefaultSeverity is used when severity_path resolves to empty.
+	// Useful for event-style alarms that have no severity field (e.g. Tencent Cloud event alarms).
+	DefaultSeverity string `json:"default_severity,omitempty"`
 }
 
 // WebhookAdapter normalises generic webhook payloads using gjson path mappings.
@@ -43,6 +53,9 @@ func (a *WebhookAdapter) Adapt(payload []byte) ([]RawAlert, error) {
 
 	alertname := strings.TrimSpace(jsonScalarString(payload, a.mapping.AlertnamePath))
 	severity := strings.TrimSpace(jsonScalarString(payload, a.mapping.SeverityPath))
+	if severity == "" && a.mapping.DefaultSeverity != "" {
+		severity = a.mapping.DefaultSeverity
+	}
 	if alertname == "" || severity == "" {
 		return nil, errors.New("missing required fields: alertname or severity (check alertname_path / severity_path)")
 	}
@@ -82,13 +95,40 @@ func (a *WebhookAdapter) Adapt(payload []byte) ([]RawAlert, error) {
 		fp = ComputeFingerprint(labels)
 	}
 
+	// Determine status from mapping
+	status := "firing"
+	if p := strings.TrimSpace(a.mapping.StatusPath); p != "" {
+		val := strings.TrimSpace(jsonScalarString(payload, p))
+		firingVals := []string{"firing", "1"}
+		resolvedVals := []string{"resolved", "0"}
+		if a.mapping.StatusFiringValue != "" {
+			firingVals = append(firingVals, a.mapping.StatusFiringValue)
+		}
+		if a.mapping.StatusResolvedValue != "" {
+			resolvedVals = append(resolvedVals, a.mapping.StatusResolvedValue)
+		}
+		valLower := strings.ToLower(val)
+		for _, fv := range firingVals {
+			if valLower == strings.ToLower(fv) {
+				status = "firing"
+				break
+			}
+		}
+		for _, rv := range resolvedVals {
+			if valLower == strings.ToLower(rv) {
+				status = "resolved"
+				break
+			}
+		}
+	}
+
 	return []RawAlert{{
 		Source:      a.source,
 		Fingerprint: fp,
 		Labels:      labels,
 		Annotations: annotations,
 		StartsAt:    startsAt,
-		Status:      "firing",
+		Status:      status,
 		RawPayload:  append([]byte(nil), payload...),
 	}}, nil
 }

@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	nethttp "net/http"
+	"regexp"
 	"sort"
 	"strings"
 	"time"
@@ -19,6 +20,8 @@ import (
 	"github.com/tmc/langchaingo/llms"
 	"github.com/tmc/langchaingo/llms/anthropic"
 	"github.com/tmc/langchaingo/llms/openai"
+	"github.com/tmc/langchaingo/schema"
+	"github.com/tmc/langchaingo/tools"
 	"gorm.io/gorm"
 
 	aitools "github.com/kuzane/alertmesh/internal/ai/tools"
@@ -105,6 +108,24 @@ func (a *Agent) Analyze(ctx context.Context, incidentID string, cb callbacks.Han
 		OpenSearchURL: a.cfg.OpenSearchURL,
 	})
 
+	language := resolveLanguage(provider)
+	prompt := buildAnalysisPrompt(inc, language)
+
+	// Anthropic models (especially Claude 3.7 with thinking blocks) trip up
+	// langchaingo's SSE/agent parsers. Use a direct Messages API ReAct loop.
+	if provider.Provider == "anthropic" {
+		log.Info().
+			Str("incident_id", incidentID).
+			Str("provider", provider.Provider).
+			Str("model", provider.ModelName).
+			Str("language", language).
+			Msg("starting AI analysis via direct Anthropic ReAct loop")
+		ctx, cancel := context.WithTimeout(ctx, 5*time.Minute)
+		defer cancel()
+		return runAnthropicReAct(ctx, apiKey, provider.BaseURL, provider.ModelName,
+			anthropicAnalysisSystemPrompt(language), prompt, agentTools, 10, cb)
+	}
+
 	// langchaingo marks Initialize "deprecated" but the only suggested
 	// replacement (NewExecutor) lacks the higher-level option helpers we
 	// rely on here; keeping Initialize keeps the call site terse.
@@ -117,9 +138,6 @@ func (a *Agent) Analyze(ctx context.Context, incidentID string, cb callbacks.Han
 	if err != nil {
 		return "", fmt.Errorf("initialize agent: %w", err)
 	}
-
-	language := resolveLanguage(provider)
-	prompt := buildAnalysisPrompt(inc, language)
 
 	log.Info().
 		Str("incident_id", incidentID).
@@ -192,6 +210,25 @@ func (a *Agent) Chat(ctx context.Context, incidentID, question string, history [
 		OpenSearchURL: a.cfg.OpenSearchURL,
 	})
 
+	reportMax, historyMax := resolveChatLimits(provider)
+	language := resolveLanguage(provider)
+	prompt := buildChatPrompt(inc, analysis.Report, history, question, reportMax, historyMax, language)
+
+	// Anthropic models (especially Claude 3.7 with thinking blocks) trip up
+	// langchaingo's SSE/agent parsers. Use a direct Messages API ReAct loop.
+	if provider.Provider == "anthropic" {
+		log.Debug().
+			Str("incident_id", incidentID).
+			Str("provider", provider.Provider).
+			Str("model", provider.ModelName).
+			Str("language", language).
+			Msg("starting AI chat via direct Anthropic ReAct loop")
+		ctx, cancel := context.WithTimeout(ctx, 5*time.Minute)
+		defer cancel()
+		return runAnthropicReAct(ctx, apiKey, provider.BaseURL, provider.ModelName,
+			anthropicChatSystemPrompt(language), prompt, agentTools, 8, cb)
+	}
+
 	agent, err := agents.Initialize( //nolint:staticcheck // langchaingo deprecation, see ZeroShot path comment
 		llm,
 		agentTools,
@@ -201,10 +238,6 @@ func (a *Agent) Chat(ctx context.Context, incidentID, question string, history [
 	if err != nil {
 		return "", fmt.Errorf("initialize conversational agent: %w", err)
 	}
-
-	reportMax, historyMax := resolveChatLimits(provider)
-	language := resolveLanguage(provider)
-	prompt := buildChatPrompt(inc, analysis.Report, history, question, reportMax, historyMax, language)
 
 	log.Debug().
 		Str("incident_id", incidentID).
@@ -939,4 +972,467 @@ func buildK8sAnalysisPrompt(req AnalyzeK8sRequest, language string) string {
 
 %s`, req.ResourceKind, subjectZh, req.Namespace, req.Name, subjectZh, req.Content)
 	}
+}
+
+// anthropicAnalysisSystemPrompt returns a concise system prompt for the direct
+// Anthropic ReAct loop used by Analyze.
+func anthropicAnalysisSystemPrompt(language string) string {
+	switch language {
+	case "en":
+		return "You are a senior SRE performing root cause analysis on a production incident. Follow the ReAct protocol exactly: think with `Thought:`, then either call a tool with `Action:` and `Action Input:`, or finish with `Final Answer:`. Keep the protocol keywords in English; only the content after `Final Answer:` should be in English."
+	case "auto":
+		return "You are a senior SRE performing root cause analysis on a production incident. Follow the ReAct protocol exactly: think with `Thought:`, then either call a tool with `Action:` and `Action Input:`, or finish with `Final Answer:`. Keep the protocol keywords in English; the content after `Final Answer:` should match the language of the incident."
+	default:
+		return "你是一名资深 SRE，正在为线上故障执行根因分析。请严格遵循 ReAct 协议：先用 `Thought:` 思考，然后要么通过 `Action:` 和 `Action Input:` 调用工具，要么用 `Final Answer:` 给出最终报告。协议关键字（Thought/Action/Action Input/Observation/Final Answer）必须保持英文，只有 `Final Answer:` 之后的内容使用简体中文。"
+	}
+}
+
+// anthropicChatSystemPrompt returns a concise system prompt for the direct
+// Anthropic ReAct loop used by Chat.
+func anthropicChatSystemPrompt(language string) string {
+	switch language {
+	case "en":
+		return "You are a senior SRE answering a follow-up question about a production incident. Follow the ReAct protocol exactly: think with `Thought:`, then either call a tool with `Action:` and `Action Input:`, or finish with `Final Answer:`. Keep the protocol keywords in English; only the content after `Final Answer:` should be in English."
+	case "auto":
+		return "You are a senior SRE answering a follow-up question about a production incident. Follow the ReAct protocol exactly: think with `Thought:`, then either call a tool with `Action:` and `Action Input:`, or finish with `Final Answer:`. Keep the protocol keywords in English; the content after `Final Answer:` should match the language of the user's question."
+	default:
+		return "你是一名资深 SRE，正在回答同事关于线上故障的追问。请严格遵循 ReAct 协议：先用 `Thought:` 思考，然后要么通过 `Action:` 和 `Action Input:` 调用工具，要么用 `Final Answer:` 给出最终回答。协议关键字必须保持英文，只有 `Final Answer:` 之后的内容使用简体中文。"
+	}
+}
+
+// anthropicMessage is a single message in the Anthropic Messages API.
+type anthropicMessage struct {
+	Role    string `json:"role"`
+	Content string `json:"content"`
+}
+
+// anthropicRequest is the request body for the Anthropic Messages API.
+type anthropicRequest struct {
+	Model     string             `json:"model"`
+	MaxTokens int                `json:"max_tokens"`
+	System    string             `json:"system,omitempty"`
+	Stream    bool               `json:"stream"`
+	Messages  []anthropicMessage `json:"messages"`
+}
+
+var (
+	finalAnswerRe = regexp.MustCompile(`(?s)Final Answer:\s*(.*)`)
+	actionNameRe  = regexp.MustCompile(`(?s)Action:\s*(\S+)`)
+	actionInputRe = regexp.MustCompile(`(?s)Action Input:\s*(.*)`)
+)
+
+// extractFinalAnswer returns the text after "Final Answer:" if present.
+func extractFinalAnswer(text string) string {
+	matches := finalAnswerRe.FindStringSubmatch(text)
+	if len(matches) < 2 {
+		return ""
+	}
+	s := strings.TrimSpace(matches[1])
+	if s == "" {
+		return ""
+	}
+	return s
+}
+
+// extractAction parses a ReAct step and returns the tool name and input.
+func extractAction(text string) (string, string) {
+	nameMatch := actionNameRe.FindStringSubmatch(text)
+	inputMatch := actionInputRe.FindStringSubmatch(text)
+	if len(nameMatch) < 2 || len(inputMatch) < 2 {
+		return "", ""
+	}
+	return strings.TrimSpace(nameMatch[1]), strings.TrimSpace(inputMatch[1])
+}
+
+// executeTool finds and calls the named tool.
+func executeTool(ctx context.Context, toolSet []tools.Tool, name, input string) (string, error) {
+	for _, t := range toolSet {
+		if t.Name() == name {
+			return t.Call(ctx, input)
+		}
+	}
+	return "", fmt.Errorf("unknown tool: %s", name)
+}
+
+// callAnthropicMessages makes a streaming request to the Anthropic Messages
+// API and returns the concatenated text content (ignoring thinking blocks and
+// any other non-text deltas). Streaming is used to match the behaviour of the
+// existing K8s analysis path and the LLM-provider connectivity test.
+func callAnthropicMessages(ctx context.Context, apiKey, baseURL, modelName, systemPrompt string, messages []anthropicMessage) (string, error) {
+	if baseURL == "" {
+		baseURL = "https://api.anthropic.com/v1"
+	} else {
+		baseURL = strings.TrimRight(baseURL, "/")
+		if !strings.HasSuffix(baseURL, "/v1") {
+			baseURL += "/v1"
+		}
+	}
+
+	body, _ := json.Marshal(anthropicRequest{
+		Model:     modelName,
+		MaxTokens: 4096,
+		System:    systemPrompt,
+		Stream:    true,
+		Messages:  messages,
+	})
+
+	httpReq, err := nethttp.NewRequestWithContext(ctx, nethttp.MethodPost, baseURL+"/messages", bytes.NewReader(body))
+	if err != nil {
+		return "", fmt.Errorf("build anthropic request: %w", err)
+	}
+	httpReq.Header.Set("Content-Type", "application/json")
+	httpReq.Header.Set("x-api-key", apiKey)
+	httpReq.Header.Set("anthropic-version", "2023-06-01")
+
+	resp, err := nethttp.DefaultClient.Do(httpReq)
+	if err != nil {
+		return "", fmt.Errorf("anthropic request: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != nethttp.StatusOK {
+		errBody, _ := io.ReadAll(io.LimitReader(resp.Body, 64*1024))
+		return "", fmt.Errorf("anthropic API error %d: %s", resp.StatusCode, errBody)
+	}
+
+	scanner := bufio.NewScanner(resp.Body)
+	var text strings.Builder
+	for scanner.Scan() {
+		line := scanner.Text()
+		var data string
+		if strings.HasPrefix(line, "data: ") {
+			data = line[6:]
+		} else if strings.HasPrefix(line, "data:") {
+			data = line[5:]
+		} else {
+			continue
+		}
+		if data == "[DONE]" {
+			break
+		}
+
+		var event struct {
+			Type  string `json:"type"`
+			Delta struct {
+				Type     string `json:"type"`
+				Text     string `json:"text"`
+				Thinking string `json:"thinking"`
+			} `json:"delta"`
+			Error struct {
+				Type    string `json:"type"`
+				Message string `json:"message"`
+			} `json:"error"`
+		}
+		if err := json.Unmarshal([]byte(data), &event); err != nil {
+			continue
+		}
+		switch event.Type {
+		case "content_block_delta":
+			if event.Delta.Type == "text_delta" {
+				text.WriteString(event.Delta.Text)
+			}
+		case "error":
+			return "", fmt.Errorf("anthropic stream error: %s – %s", event.Error.Type, event.Error.Message)
+		}
+	}
+	return text.String(), scanner.Err()
+}
+
+// runAnthropicReAct implements a ReAct agent directly against the Anthropic
+// Messages API. It is used for both Analyze and Chat when the configured LLM
+// provider is Anthropic, bypassing langchaingo to avoid parsing failures on
+// Claude thinking blocks.
+func runAnthropicReAct(ctx context.Context, apiKey, baseURL, modelName, systemPrompt, initialUserPrompt string, toolSet []tools.Tool, maxIterations int, cb callbacks.Handler) (string, error) {
+	messages := []anthropicMessage{{Role: "user", Content: initialUserPrompt}}
+
+	for i := 0; i < maxIterations; i++ {
+		if cb != nil {
+			cb.HandleLLMStart(ctx, nil)
+		}
+
+		assistantText, err := callAnthropicMessages(ctx, apiKey, baseURL, modelName, systemPrompt, messages)
+		if err != nil {
+			if cb != nil {
+				cb.HandleLLMError(ctx, err)
+			}
+			return "", err
+		}
+
+		if cb != nil {
+			cb.HandleText(ctx, assistantText)
+		}
+
+		messages = append(messages, anthropicMessage{Role: "assistant", Content: assistantText})
+
+		// Prefer Final Answer: the model is done.
+		if finalAnswer := extractFinalAnswer(assistantText); finalAnswer != "" {
+			if cb != nil {
+				cb.HandleAgentFinish(ctx, schema.AgentFinish{ReturnValues: map[string]any{"output": finalAnswer}})
+			}
+			return finalAnswer, nil
+		}
+
+		// Otherwise expect a tool call.
+		toolName, toolInput := extractAction(assistantText)
+		if toolName == "" {
+			return "", fmt.Errorf("model response contained neither Final Answer nor valid Action/Action Input")
+		}
+
+		if cb != nil {
+			cb.HandleAgentAction(ctx, schema.AgentAction{Tool: toolName, ToolInput: toolInput, Log: assistantText})
+			cb.HandleToolStart(ctx, toolInput)
+		}
+
+		toolResult, err := executeTool(ctx, toolSet, toolName, toolInput)
+		if err != nil {
+			toolResult = fmt.Sprintf("tool execution error: %v", err)
+		}
+
+		if cb != nil {
+			cb.HandleToolEnd(ctx, toolResult)
+		}
+
+		log.Debug().
+			Str("tool", toolName).
+			Int("iteration", i+1).
+			Int("result_len", len(toolResult)).
+			Msg("anthropic ReAct tool executed")
+
+		messages = append(messages, anthropicMessage{Role: "user", Content: "Observation: " + toolResult})
+	}
+
+	return "", fmt.Errorf("exceeded maximum %d ReAct iterations without Final Answer", maxIterations)
+}
+
+// ─── Period Report ───────────────────────────────────────────────────────────
+
+// PeriodReportInput carries the metadata for a periodic alert report.
+type PeriodReportInput struct {
+	Period    string    // "day" / "week" / "month"
+	StartTime time.Time // inclusive
+	EndTime   time.Time // exclusive
+}
+
+// AnalyzePeriod queries incidents in [input.StartTime, input.EndTime) and
+// calls the default LLM to generate a Markdown summary report.
+// Each token is forwarded to onToken as it arrives (streaming).
+func (a *Agent) AnalyzePeriod(ctx context.Context, input PeriodReportInput, onToken func(string)) error {
+	var incidents []model.Incident
+	if err := a.db.WithContext(ctx).
+		Preload("Alerts").
+		Where("opened_at >= ? AND opened_at < ?", input.StartTime, input.EndTime).
+		Order("opened_at ASC").
+		Find(&incidents).Error; err != nil {
+		return fmt.Errorf("load incidents: %w", err)
+	}
+
+	var provider model.LLMProvider
+	if err := a.db.WithContext(ctx).Where("is_default = ? AND is_enabled = ?", true, true).First(&provider).Error; err != nil {
+		return fmt.Errorf("no default LLM provider configured: %w", err)
+	}
+
+	apiKey, err := a.decryptAPIKey(provider.APIKey)
+	if err != nil {
+		return fmt.Errorf("decrypt LLM API key: %w", err)
+	}
+
+	language := resolveLanguage(provider)
+	prompt := buildPeriodReportPrompt(input, incidents, language)
+
+	log.Info().
+		Str("period", input.Period).
+		Time("start", input.StartTime).
+		Time("end", input.EndTime).
+		Int("incident_count", len(incidents)).
+		Str("provider", provider.Provider).
+		Msg("starting period AI report")
+
+	if provider.Provider == "anthropic" {
+		return streamAnthropicDirect(ctx, apiKey, provider.BaseURL, provider.ModelName, prompt, onToken)
+	}
+
+	llmModel, err := newLLMFromProvider(provider, apiKey, nil)
+	if err != nil {
+		return fmt.Errorf("create LLM client: %w", err)
+	}
+	_, err = llmModel.GenerateContent(ctx,
+		[]llms.MessageContent{
+			{Role: llms.ChatMessageTypeHuman, Parts: []llms.ContentPart{llms.TextPart(prompt)}},
+		},
+		llms.WithStreamingFunc(func(_ context.Context, chunk []byte) error {
+			if len(chunk) > 0 {
+				onToken(string(chunk))
+			}
+			return nil
+		}),
+	)
+	return err
+}
+
+// buildPeriodReportPrompt constructs the LLM prompt for a periodic alert report.
+func buildPeriodReportPrompt(input PeriodReportInput, incidents []model.Incident, language string) string {
+	type resourceKey struct{ title, source string }
+	freq := map[resourceKey]int{}
+	sevCount := map[string]int{}
+	var totalDurMins float64
+	var maxDurMins float64
+	resolved := 0
+	now := time.Now()
+
+	for _, inc := range incidents {
+		rk := resourceKey{title: inc.Title, source: inc.Source}
+		freq[rk]++
+		sevCount[inc.Severity]++
+		var durMins float64
+		if inc.ResolvedAt != nil {
+			durMins = inc.ResolvedAt.Sub(inc.OpenedAt).Minutes()
+			totalDurMins += durMins
+			resolved++
+		} else {
+			// still open: count elapsed time
+			durMins = now.Sub(inc.OpenedAt).Minutes()
+		}
+		if durMins > maxDurMins {
+			maxDurMins = durMins
+		}
+	}
+
+	type freqEntry struct {
+		title  string
+		source string
+		count  int
+	}
+	entries := make([]freqEntry, 0, len(freq))
+	for rk, cnt := range freq {
+		entries = append(entries, freqEntry{title: rk.title, source: rk.source, count: cnt})
+	}
+	sort.Slice(entries, func(i, j int) bool { return entries[i].count > entries[j].count })
+	if len(entries) > 10 {
+		entries = entries[:10]
+	}
+
+	var topN strings.Builder
+	for i, e := range entries {
+		fmt.Fprintf(&topN, "%d. [%s] %s (告警次数: %d)\n", i+1, e.source, e.title, e.count)
+	}
+
+	var avgDur, maxDur string
+	if resolved > 0 {
+		avg := totalDurMins / float64(resolved)
+		if avg < 60 {
+			avgDur = fmt.Sprintf("%.0f 分钟", avg)
+		} else {
+			avgDur = fmt.Sprintf("%.1f 小时", avg/60)
+		}
+	} else {
+		avgDur = "N/A"
+	}
+	if maxDurMins > 0 {
+		if maxDurMins < 60 {
+			maxDur = fmt.Sprintf("%.0f 分钟", maxDurMins)
+		} else {
+			maxDur = fmt.Sprintf("%.1f 小时", maxDurMins/60)
+		}
+	} else {
+		maxDur = "N/A"
+	}
+
+	periodZh := map[string]string{"day": "天", "week": "周", "month": "月"}[input.Period]
+	if periodZh == "" {
+		periodZh = input.Period
+	}
+
+	if language == "en" {
+		return fmt.Sprintf(`You are a senior SRE preparing a periodic alert report.
+
+## Report Period
+- Period: %s (%s → %s)
+
+## Alert Statistics
+- Total incidents: %d  Resolved: %d  Avg resolution: %s  Max duration: %s
+- By severity: P0=%d P1=%d P2=%d P3=%d
+
+## Top Frequent Resources
+%s
+## All Incidents (chronological, duration=(進行中) means still open)
+%s
+Write a concise Markdown report with sections: Overview, Top Alert Resources, Severity Trend, Duration Analysis, Key Findings, Recommendations.`,
+			input.Period,
+			input.StartTime.Format("2006-01-02 15:04"),
+			input.EndTime.Format("2006-01-02 15:04"),
+			len(incidents), resolved, avgDur, maxDur,
+			sevCount["P0"], sevCount["P1"], sevCount["P2"], sevCount["P3"],
+			topN.String(),
+			buildIncidentListBlock(incidents),
+		)
+	}
+
+	// zh / auto
+	return fmt.Sprintf(`你是一名资深 SRE，正在撰写一份告警周期报告。
+
+## 报告周期
+- 周期类型：按%s
+- 统计范围：%s ～ %s
+
+## 告警统计
+- 总事件数：%d
+- 已解决：%d
+- 平均处理时长：%s
+- 最长持续时长：%s（进行中的事件按已经持续时间计入）
+- 按严重等级：P0=%d  P1=%d  P2=%d  P3=%d
+
+## 高频告警资源 TOP 10
+%s
+## 全部事件列表（时间顺序，duration=进行中表示尚未关闭）
+%s
+请以 Markdown 格式输出，必须包含以下章节（使用以下中文标题）：
+
+### 概览
+### 高频告警资源分析
+### 严重等级分布
+### 持续时长分析
+### 关键发现
+### 优化建议
+`,
+		periodZh,
+		input.StartTime.Format("2006-01-02 15:04"),
+		input.EndTime.Format("2006-01-02 15:04"),
+		len(incidents), resolved, avgDur, maxDur,
+		sevCount["P0"], sevCount["P1"], sevCount["P2"], sevCount["P3"],
+		topN.String(),
+		buildIncidentListBlock(incidents),
+	)
+}
+
+// fmtDurMins returns a human-readable duration string for the given minutes.
+func fmtDurMins(mins float64) string {
+	if mins < 60 {
+		return fmt.Sprintf("%.0fm", mins)
+	}
+	return fmt.Sprintf("%.1fh", mins/60)
+}
+
+// buildIncidentListBlock renders a compact incident list for the prompt (max 50 rows).
+// Unresolved incidents show elapsed time up to now so the LLM can reason about ongoing alerts.
+func buildIncidentListBlock(incidents []model.Incident) string {
+	const maxIncidents = 50
+	now := time.Now()
+	var b strings.Builder
+	for i, inc := range incidents {
+		if i >= maxIncidents {
+			fmt.Fprintf(&b, "\n... (共 %d 条，已截断显示前 %d 条)\n", len(incidents), maxIncidents)
+			break
+		}
+		var dur string
+		if inc.ResolvedAt != nil {
+			dur = fmtDurMins(inc.ResolvedAt.Sub(inc.OpenedAt).Minutes())
+		} else {
+			// still open: show elapsed time as a lower bound
+			dur = fmtDurMins(now.Sub(inc.OpenedAt).Minutes()) + "(进行中)"
+		}
+		fmt.Fprintf(&b, "- [%s][%s] %s  source=%s  alerts=%d  status=%s  duration=%s\n",
+			inc.OpenedAt.Format("01-02 15:04"),
+			inc.Severity, inc.Title, inc.Source, len(inc.Alerts), inc.Status, dur)
+	}
+	return b.String()
 }

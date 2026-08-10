@@ -117,7 +117,7 @@ export function ContactDrawer({
             <Input placeholder="请输入" />
           </Form.Item>
 
-          <Form.Item name="email" label={<span style={{ color: c.textBody, fontSize: 13 }}>邮筱</span>}>
+          <Form.Item name="email" label={<span style={{ color: c.textBody, fontSize: 13 }}>邮箱</span>}>
             <Input placeholder="请输入" />
           </Form.Item>
 
@@ -188,6 +188,7 @@ export function ContactDrawer({
 
 // Validation hint shown below the name field.
 function NameRules() {
+  const { c } = useTheme()
   const rules = [
     '不能以数字、中划线、下划线或其他特殊字符开头',
     '只能包含大小写字母、中文、数字、中划线或下划线',
@@ -216,6 +217,7 @@ interface WebhookFieldsProps {
 function WebhookFields({
   title, urlField, tokenField, tokenPlaceholder, extraField, extraPlaceholder,
 }: WebhookFieldsProps) {
+  const { c } = useTheme()
   return (
     <div style={{ marginBottom: 16 }}>
       <div style={{ color: c.textHint, fontSize: 12, marginBottom: 6 }}>{title}</div>

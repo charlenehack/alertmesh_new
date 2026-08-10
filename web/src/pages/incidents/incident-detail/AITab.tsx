@@ -97,7 +97,17 @@ export function AITab(p: AITabProps) {
               <Alert
                 type="error"
                 message="AI 分析失败"
-                description="请检查 LLM Provider 配置是否正确，或点击右侧「重新分析」重试。"
+                description={
+                  <div>
+                    <div>
+                      {wsMessages.filter((m) => m.type === 'analysis_error').slice(-1)[0]?.content
+                        ?? '请检查 LLM Provider 配置是否正确，或点击右侧「重新分析」重试。'}
+                    </div>
+                    <div style={{ marginTop: 8, fontSize: 12, color: '#999' }}>
+                      提示：检查系统设置中的默认 LLM Provider 是否启用、模型名称和 API Key 是否正确。
+                    </div>
+                  </div>
+                }
                 showIcon
               />
             )}

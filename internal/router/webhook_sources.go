@@ -112,32 +112,45 @@ func (h *alertCenterHandler) createWebhookSource(req *restful.Request, resp *res
 		in.AllowSkew = 300
 	}
 
-	clientID, err := newClientID()
-	if err != nil {
-		httputil.InternalError(resp, "failed to generate client_id: "+err.Error())
-		return
-	}
-	pubPEM, privPEM, err := generateEd25519Keypair()
-	if err != nil {
-		httputil.InternalError(resp, "failed to generate keypair: "+err.Error())
-		return
-	}
-
 	row := model.WebhookSource{
 		Name:        in.Name,
-		ClientID:    clientID,
-		PublicKey:   pubPEM,
 		AllowSkew:   in.AllowSkew,
 		IsEnabled:   true,
+		IsUnsigned:  in.IsUnsigned,
 		Description: in.Description,
 		Mapping:     normaliseWebhookMappingJSON(in.Mapping),
 	}
+
+	// Unsigned sources use webhook-plain endpoint, no keypair needed.
+	if !in.IsUnsigned {
+		clientID, err := newClientID()
+		if err != nil {
+			httputil.InternalError(resp, "failed to generate client_id: "+err.Error())
+			return
+		}
+		pubPEM, privPEM, err := generateEd25519Keypair()
+		if err != nil {
+			httputil.InternalError(resp, "failed to generate keypair: "+err.Error())
+			return
+		}
+		row.ClientID = clientID
+		row.PublicKey = pubPEM
+		row.ID = ""
+		if err := h.db.WithContext(req.Request.Context()).Create(&row).Error; err != nil {
+			httputil.InternalError(resp, err.Error())
+			return
+		}
+		httputil.Created(resp, webhookSourceCreated{WebhookSource: row, PrivateKeyPEM: privPEM})
+		return
+	}
+
+	// Unsigned path: no key material.
 	row.ID = ""
 	if err := h.db.WithContext(req.Request.Context()).Create(&row).Error; err != nil {
 		httputil.InternalError(resp, err.Error())
 		return
 	}
-	httputil.Created(resp, webhookSourceCreated{WebhookSource: row, PrivateKeyPEM: privPEM})
+	httputil.Created(resp, row)
 }
 
 func (h *alertCenterHandler) updateWebhookSource(req *restful.Request, resp *restful.Response) {
@@ -167,6 +180,7 @@ func (h *alertCenterHandler) updateWebhookSource(req *restful.Request, resp *res
 		existing.AllowSkew = in.AllowSkew
 	}
 	existing.IsEnabled = in.IsEnabled
+	existing.IsUnsigned = in.IsUnsigned
 	existing.Description = in.Description
 	if len(in.Mapping) > 0 {
 		existing.Mapping = normaliseWebhookMappingJSON(in.Mapping)

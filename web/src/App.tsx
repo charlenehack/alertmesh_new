@@ -29,6 +29,7 @@ const AlertRoutes = lazy(() => import('./pages/alert/AlertRoutes'))
 const AggregationPolicies = lazy(() => import('./pages/alert/AggregationPolicies'))
 const SilencePolicies = lazy(() => import('./pages/alert/SilencePolicies'))
 const WebhookSources = lazy(() => import('./pages/alert/WebhookSources'))
+const AIReports = lazy(() => import('./pages/alert/AIReports'))
 const UserList = lazy(() => import('./pages/users/UserList'))
 const RoleList = lazy(() => import('./pages/users/RoleList'))
 const SystemSettings = lazy(() => import('./pages/settings/SystemSettings'))
@@ -117,6 +118,7 @@ function ThemedApp() {
               <Route path="alert/channels" element={<NotificationChannels />} />
               <Route path="alert/templates" element={<NotificationTemplates />} />
               <Route path="alert/webhook-sources" element={<WebhookSources />} />
+              <Route path="alert/reports" element={<AIReports />} />
 
               {/* System – admin only (frontend guards in AppLayout) */}
               <Route path="users" element={<UserList />} />

@@ -72,6 +72,16 @@ func (h *alertHandler) registerRoutes(ws *restful.WebService) {
 		Metadata(label.MetaIdentity, label.AlertIngest).
 		Metadata(label.MetaModule, label.AlertModuleName).
 		Metadata(label.MetaKind, "AlertWebhook"))
+
+	// 无签名 Webhook：复用 webhook_sources 表的 mapping 配置，但不要求 RFC 9421 签名。
+	// 适用于腾讯云/阿里云等不能做签名的云平台，或自定义应用推送。
+	// MetaKind 设为 "AlertWebhookPlain" 以绕过签名中间件。
+	ws.Route(ws.POST("/alerts/webhook-plain/{source}").
+		To(h.receiveWebhookPlain).
+		Doc("Receive webhook alerts without signature (uses webhook_sources mapping)").
+		Metadata(label.MetaIdentity, label.AlertIngest).
+		Metadata(label.MetaModule, label.AlertModuleName).
+		Metadata(label.MetaKind, "AlertWebhookPlain"))
 }
 
 // registerV2Routes wires the Alertmanager-v2-compatible endpoint.  It lives
@@ -104,6 +114,11 @@ func (h *alertHandler) receivePrometheus(req *restful.Request, resp *restful.Res
 }
 
 func (h *alertHandler) receiveWebhook(req *restful.Request, resp *restful.Response) {
+	source := req.PathParameter("source")
+	h.ingest(req, resp, source)
+}
+
+func (h *alertHandler) receiveWebhookPlain(req *restful.Request, resp *restful.Response) {
 	source := req.PathParameter("source")
 	h.ingest(req, resp, source)
 }
@@ -203,8 +218,9 @@ func (h *alertHandler) webhookAdapterForSource(ctx context.Context, source strin
 	if jerr != nil {
 		return nil, jerr
 	}
-	if strings.TrimSpace(m.AlertnamePath) == "" || strings.TrimSpace(m.SeverityPath) == "" {
-		return nil, fmt.Errorf("webhook source %q: mapping must set alertname_path and severity_path (configure in 告警中心 → Webhook 可信源)", source)
+	if strings.TrimSpace(m.AlertnamePath) == "" ||
+		(strings.TrimSpace(m.SeverityPath) == "" && strings.TrimSpace(m.DefaultSeverity) == "") {
+		return nil, fmt.Errorf("webhook source %q: mapping must set alertname_path and (severity_path or default_severity) (configure in 告警中心 → Webhook 可信源)", source)
 	}
 	return ingestion.NewWebhookAdapter(source, m), nil
 }

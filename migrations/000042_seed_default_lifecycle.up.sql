@@ -25,8 +25,8 @@ INSERT INTO system_configs (key, value, description) VALUES
     ('notification.repeat_schedule',
      '[{"after":"0s","interval":"30m","tag":"[REPEAT]"},{"after":"3h","interval":"2h","tag":"[ATTENTION]","escalate":true},{"after":"24h","interval":"6h","tag":"[REPEAT]"}]',
      'JSON ladder for progressive re-notification of ongoing incidents.'),
-    ('incident.staleness_timeout', '10m',
-     'Auto-resolve open incidents with no new firing alert for this duration.'),
+    ('incident.staleness_timeout', '0',
+     'Auto-resolve open incidents with no new firing alert for this duration. Set to 0 to disable; auto-resolve then requires an explicit recovery signal (e.g. Tencent Cloud alarmStatus=0 or Prometheus endsAt).'),
     ('incident.reopen_window', '5m',
      'Same group_key within this window after resolve reopens the old incident.')
 ON CONFLICT (key) DO NOTHING;

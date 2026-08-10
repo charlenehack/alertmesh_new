@@ -5,6 +5,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net"
+	"regexp"
 	"sort"
 	"strings"
 	"sync"
@@ -712,9 +714,9 @@ func (s *Service) reopenWindow(ctx context.Context) time.Duration {
 }
 
 // stalenessTimeout returns the configured `incident.staleness_timeout`
-// duration (default 10m).  Returning 0 disables the staleness reaper.
+// duration (default 0/disabled).  Returning 0 disables the staleness reaper.
 func (s *Service) stalenessTimeout(ctx context.Context) time.Duration {
-	const defaultTimeout = 10 * time.Minute
+	const defaultTimeout = 0
 
 	var row model.SystemConfig
 	if err := s.db.WithContext(ctx).
@@ -898,6 +900,15 @@ func (s *Service) autoResolve(ctx context.Context, inc *model.Incident, reason, 
 	inc.Status = model.IncidentStatusResolved
 	inc.ResolvedAt = &now
 	inc.AutoResolvedAt = &now
+
+	// Sync the status of every firing alert that belongs to this incident so
+	// the alert list on the detail page shows "resolved" instead of "firing".
+	if err := s.db.WithContext(ctx).
+		Model(&model.Alert{}).
+		Where("incident_id = ? AND status = ?", inc.ID, model.AlertStatusFiring).
+		Update("status", model.AlertStatusResolved).Error; err != nil {
+		log.Warn().Err(err).Str("incident_id", inc.ID).Msg("autoResolve: failed to update alert statuses")
+	}
 
 	_ = s.timeline.Record(ctx, &model.IncidentTimeline{
 		IncidentID: inc.ID,
@@ -1221,12 +1232,110 @@ func (s *Service) notifyIncidentEvent(ctx context.Context, eventType string, inc
 	}
 }
 
+// ipv4Re matches an IPv4 address embedded in longer strings (e.g. Tencent
+// Cloud dimensions like "1251890496#101.42.12.33 #eip-03czz65d#未命名").
+var ipv4Re = regexp.MustCompile(`\b(?:\d{1,3}\.){3}\d{1,3}\b`)
+
+// cleanInstanceIdentifier picks the most useful part of a cloud dimension
+// string.  Plain IPs/IDs are kept as-is; hash-delimited blobs are reduced to
+// the embedded IP when one exists, otherwise the original value is preserved.
+func cleanInstanceIdentifier(s string) string {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return ""
+	}
+	if net.ParseIP(s) != nil {
+		return s
+	}
+	if ip := ipv4Re.FindString(s); ip != "" {
+		return ip
+	}
+	return s
+}
+
+// containsIPv4 reports whether s has an IPv4 address embedded in it.
+func containsIPv4(s string) bool {
+	return ipv4Re.MatchString(strings.TrimSpace(s))
+}
+
+// buildTitle produces a concise, human-readable incident title.
 func buildTitle(group engine.AlertGroup) string {
 	name := group.Labels["alertname"]
 	if name == "" {
 		name = "Unknown Alert"
 	}
-	return "[" + group.Severity + "] " + name
+
+	// Enrich the title with meaningful context for cloud-provider alarms
+	// (e.g. Tencent Cloud): instance IP/ID and the triggering metric or event.
+	// We try several common dimension fields because different cloud products
+	// expose the identifying value under different keys (unInstanceId, objId,
+	// objName, deviceName, or IP directly).
+	parts := []string{name}
+	instance := ""
+	// Candidate keys ordered from most specific (IP) to least specific (cloud
+	// IDs).  We do two passes: first prefer any candidate that contains an IP,
+	// so labels like obj_name=10.100.84.10#8469859 win over device_name=主机名.
+	// First pass: find a label value that contains an IPv4.
+	ipKeys := []string{
+		"ip", "instance_ip", "private_ip", "public_ip", "ip_address", "local_ip", "remote_ip",
+		"instance", "hostname", "host", "node",
+		"device_name", "obj_name", "obj_id", "instance_id",
+	}
+	for _, key := range ipKeys {
+		if v := strings.TrimSpace(group.Labels[key]); v != "" && containsIPv4(v) {
+			instance = cleanInstanceIdentifier(v)
+			break
+		}
+	}
+	// Second pass: no IP found – take the first non-empty candidate as name.
+	var hostName string
+	for _, key := range []string{"device_name", "hostname", "host", "node"} {
+		if v := strings.TrimSpace(group.Labels[key]); v != "" && !containsIPv4(v) {
+			hostName = v
+			break
+		}
+	}
+	if instance == "" {
+		for _, key := range ipKeys {
+			if v := strings.TrimSpace(group.Labels[key]); v != "" {
+				instance = cleanInstanceIdentifier(v)
+				break
+			}
+		}
+	}
+	// Final fallback: scan all labels for any value that looks like an IPv4.
+	if instance == "" {
+		for _, v := range group.Labels {
+			if ip := ipv4Re.FindString(strings.TrimSpace(v)); ip != "" {
+				instance = ip
+				break
+			}
+		}
+	}
+	// Build instance label: "IP (主机名)" when both are available and differ.
+	var instanceLabel string
+	switch {
+	case instance != "" && hostName != "" && hostName != instance:
+		instanceLabel = instance + " (" + hostName + ")"
+	case instance != "":
+		instanceLabel = instance
+	case hostName != "":
+		instanceLabel = hostName
+	}
+	if instanceLabel != "" {
+		parts = append(parts, instanceLabel)
+	}
+	var reason string
+	if metric := strings.TrimSpace(group.Labels["metric"]); metric != "" {
+		reason = metric
+	} else if event := strings.TrimSpace(group.Labels["event_name"]); event != "" {
+		reason = event
+	}
+	if reason != "" {
+		parts = append(parts, reason)
+	}
+
+	return "[" + group.Severity + "] " + strings.Join(parts, " / ")
 }
 
 // Notification body rendering caps.  These are channel-agnostic guards

@@ -1,6 +1,8 @@
 package router
 
 import (
+	"strings"
+
 	"golang.org/x/crypto/bcrypt"
 
 	restful "github.com/emicklei/go-restful/v3"
@@ -459,7 +461,15 @@ func (h *systemHandler) updateConfig(req *restful.Request, resp *restful.Respons
 		httputil.BadRequest(resp, "use /configs/auth to manage sensitive configuration")
 		return
 	}
-	h.db.WithContext(req.Request.Context()).Save(&cfg)
+	cfg.Value = strings.TrimSpace(cfg.Value)
+	if cfg.Value == "" {
+		httputil.BadRequest(resp, "value is required")
+		return
+	}
+	if err := h.db.WithContext(req.Request.Context()).Save(&cfg).Error; err != nil {
+		httputil.InternalError(resp, err.Error())
+		return
+	}
 	httputil.Success(resp, cfg)
 }
 

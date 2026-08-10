@@ -42,8 +42,11 @@
       become: true
       register: nginx_test
       failed_when: nginx_test.rc != 0
+      check_mode: no
 
     - name: 重载 Nginx
       command: "{{ nginx_cmd }} -s reload"
       become: true
-      when: nginx_test.rc == 0
+      when:
+        - not ansible_check_mode
+        - nginx_test.rc == 0

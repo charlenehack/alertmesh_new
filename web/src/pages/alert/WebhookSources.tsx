@@ -54,6 +54,8 @@ export default function WebhookSources() {
   const [editing, setEditing] = useState<WebhookSource | null>(null)
   const [form] = Form.useForm()
 
+  const [isUnsigned, setIsUnsigned] = useState(false)
+
   const [revealed, setRevealed] = useState<WebhookSourceCreated | null>(null)
 
   const { data, isLoading } = useQuery({
@@ -80,8 +82,14 @@ export default function WebhookSources() {
       setOpen(false)
       form.resetFields()
       setEditing(null)
+      setIsUnsigned(false)
       if (result.kind === 'create') {
-        setRevealed(result.data)
+        // Only show key modal for signed sources
+        if (!result.data.is_unsigned) {
+          setRevealed(result.data as WebhookSourceCreated)
+        } else {
+          message.success('已创建')
+        }
       } else {
         message.success('已更新')
       }
@@ -115,12 +123,13 @@ export default function WebhookSources() {
     {
       title: '名称 (URL path)',
       dataIndex: 'name',
-      render: (n: string) => (
+      render: (n: string, row: WebhookSource) => (
         <Space>
           <Text style={{ fontWeight: 500 }}>{n}</Text>
           <Text type="secondary" style={{ fontSize: 11, fontFamily: 'monospace' }}>
-            POST /api/v1/alerts/webhook/{n}
+            POST /api/v1/alerts/{row.is_unsigned ? 'webhook-plain' : 'webhook'}/{n}
           </Text>
+          {row.is_unsigned && <Tag color="blue" style={{ fontSize: 10 }}>无签名</Tag>}
         </Space>
       ),
     },
@@ -128,20 +137,24 @@ export default function WebhookSources() {
       title: 'Client ID (keyid)',
       dataIndex: 'client_id',
       width: 220,
-      render: (cid: string) => (
-        <Space size={4}>
-          <Text code style={{ fontSize: 11 }}>{cid}</Text>
-          <Tooltip title="复制 keyid">
-            <Button size="small" type="text" icon={<CopyOutlined />} onClick={() => copy(cid, 'keyid')} />
-          </Tooltip>
-        </Space>
-      ),
+      render: (cid: string, row: WebhookSource) => row.is_unsigned
+        ? <Text type="secondary" style={{ fontSize: 11 }}>—</Text>
+        : (
+          <Space size={4}>
+            <Text code style={{ fontSize: 11 }}>{cid}</Text>
+            <Tooltip title="复制 keyid">
+              <Button size="small" type="text" icon={<CopyOutlined />} onClick={() => copy(cid, 'keyid')} />
+            </Tooltip>
+          </Space>
+        ),
     },
     {
       title: '允许时钟偏差',
       dataIndex: 'allow_skew',
       width: 120,
-      render: (s: number) => <Tag style={{ fontSize: 11 }}>±{s}s</Tag>,
+      render: (s: number, row: WebhookSource) => row.is_unsigned
+        ? <Text type="secondary" style={{ fontSize: 11 }}>—</Text>
+        : <Tag style={{ fontSize: 11 }}>±{s}s</Tag>,
     },
     {
       title: '启用',
@@ -166,27 +179,31 @@ export default function WebhookSources() {
             <Button size="small" icon={<EditOutlined />} type="text"
               onClick={() => {
                 setEditing(row)
+                setIsUnsigned(row.is_unsigned ?? false)
                 form.setFieldsValue({
                   name: row.name,
                   description: row.description,
                   allow_skew: row.allow_skew,
                   is_enabled: row.is_enabled,
+                  is_unsigned: row.is_unsigned ?? false,
                   mapping_json: JSON.stringify(row.mapping ?? {}, null, 2),
                 })
                 setOpen(true)
               }} />
           </Tooltip>
-          <Popconfirm
-            title="轮换密钥？"
-            description="旧密钥会立即失效，外部告警源必须使用新返回的私钥重新配置。"
-            okText="轮换"
-            okButtonProps={{ danger: true, loading: rotateMut.isPending }}
-            onConfirm={() => rotateMut.mutate(row.id)}
-          >
-            <Tooltip title="轮换密钥（旧密钥立即失效）">
-              <Button size="small" icon={<ReloadOutlined />} type="text" />
-            </Tooltip>
-          </Popconfirm>
+          {!row.is_unsigned && (
+            <Popconfirm
+              title="轮换密钥？"
+              description="旧密钥会立即失效，外部告警源必须使用新返回的私钥重新配置。"
+              okText="轮换"
+              okButtonProps={{ danger: true, loading: rotateMut.isPending }}
+              onConfirm={() => rotateMut.mutate(row.id)}
+            >
+              <Tooltip title="轮换密钥（旧密钥立即失效）">
+                <Button size="small" icon={<ReloadOutlined />} type="text" />
+              </Tooltip>
+            </Popconfirm>
+          )}
           <Popconfirm title="确认删除？" onConfirm={() => deleteMut.mutate(row.id)}>
             <Button size="small" icon={<DeleteOutlined />} type="text" danger />
           </Popconfirm>
@@ -205,10 +222,12 @@ export default function WebhookSources() {
           <Button type="primary" icon={<PlusOutlined />}
             onClick={() => {
               setEditing(null)
+              setIsUnsigned(false)
               form.resetFields()
               form.setFieldsValue({
                 allow_skew: 300,
                 is_enabled: true,
+                is_unsigned: false,
                 mapping_json: JSON.stringify(DEFAULT_LOG_ALERT_MAPPING, null, 2),
               })
               setOpen(true)
@@ -227,7 +246,7 @@ export default function WebhookSources() {
         title={editing ? '编辑 Webhook 源' : '新建 Webhook 源'}
         open={open}
         size={520}
-        onClose={() => { setOpen(false); setEditing(null) }}
+        onClose={() => { setOpen(false); setEditing(null); setIsUnsigned(false) }}
         styles={{
           header: { background: c.bgSurface, borderBottom: `1px solid ${c.border}`, color: c.textBody },
           body: { background: c.bgSurface, padding: '20px 24px' },
@@ -237,18 +256,27 @@ export default function WebhookSources() {
           <div style={{ display: 'flex', justifyContent: 'flex-end', gap: 8 }}>
             <Button onClick={() => { setOpen(false); setEditing(null) }}>取消</Button>
             <Button type="primary" loading={saveMut.isPending} onClick={() => form.submit()}>
-              {editing ? '保存' : '生成密钥并创建'}
+              {editing ? '保存' : (isUnsigned ? '创建' : '生成密钥并创建')}
             </Button>
           </div>
         }
       >
-        {!editing && (
+        {!editing && !isUnsigned && (
           <Alert
             type="info"
             showIcon
             style={{ marginBottom: 16 }}
             message="保存后将自动生成 Ed25519 keypair，私钥仅展示一次"
             description="请提前准备好外部告警源（脚本 / 网关）的接入文档；关闭弹窗后无法再次查看私钥，只能通过「轮换密钥」重新生成。"
+          />
+        )}
+        {!editing && isUnsigned && (
+          <Alert
+            type="info"
+            showIcon
+            style={{ marginBottom: 16 }}
+            message="无需签名模式适用于腾讯云/阿里云等不能做签名的云平台"
+            description="使用 /api/v1/alerts/webhook-plain/{name} 端点接收告警，无需配置密钥。"
           />
         )}
         <Form
@@ -262,8 +290,9 @@ export default function WebhookSources() {
               message.error('Payload 映射 不是合法 JSON')
               return
             }
-            if (!mapping.alertname_path?.trim() || !mapping.severity_path?.trim()) {
-              message.error('mapping 必须包含 alertname_path 与 severity_path')
+            if (!mapping.alertname_path?.trim() ||
+                (!mapping.severity_path?.trim() && !mapping.default_severity?.trim())) {
+              message.error('mapping 必须包含 alertname_path 与 (severity_path 或 default_severity)')
               return
             }
             const { mapping_json: _mj, ...rest } = values as Record<string, unknown> & { mapping_json?: string }
@@ -277,20 +306,35 @@ export default function WebhookSources() {
               { required: true, message: '名称必填' },
               { pattern: /^[A-Za-z0-9_-]+$/, message: '只能包含字母、数字、下划线和短横线' },
             ]}
-            extra={<span style={{ color: c.textTertiary, fontSize: 11 }}>例如填写 cloudwatch-prod，对应 URL 为 /api/v1/alerts/webhook/cloudwatch-prod</span>}
+            extra={<span style={{ color: c.textTertiary, fontSize: 11 }}>
+              例如填写 tencentcloud，对应 URL 为 /api/v1/alerts/{isUnsigned ? 'webhook-plain' : 'webhook'}/tencentcloud
+            </span>}
           >
             <Input placeholder="cloudwatch-prod" disabled={!!editing} />
           </Form.Item>
-          <Form.Item
-            name="allow_skew"
-            label="允许时钟偏差（秒）"
-            initialValue={300}
-            extra={<span style={{ color: c.textTertiary, fontSize: 11 }}>签名 created 参数与服务器时间的最大差値；过大会放宽防重放窗口。</span>}
-          >
-            <InputNumber style={{ width: '100%' }} min={5} max={3600} />
-          </Form.Item>
+          {!isUnsigned && (
+            <Form.Item
+              name="allow_skew"
+              label="允许时钟偏差（秒）"
+              initialValue={300}
+              extra={<span style={{ color: c.textTertiary, fontSize: 11 }}>签名 created 参数与服务器时间的最大差値；过大会放宽防重放窗口。</span>}
+            >
+              <InputNumber style={{ width: '100%' }} min={5} max={3600} />
+            </Form.Item>
+          )}
           <Form.Item name="is_enabled" label="启用" valuePropName="checked" initialValue={true}>
             <Switch />
+          </Form.Item>
+          <Form.Item
+            name="is_unsigned"
+            label="无需签名（用于腾讯云/阿里云等不能签名的平台）"
+            valuePropName="checked"
+            initialValue={false}
+            extra={<span style={{ color: c.textTertiary, fontSize: 11 }}>
+              开启后使用 /api/v1/alerts/webhook-plain/ 端点，不生成密钥
+            </span>}
+          >
+            <Switch onChange={(checked) => setIsUnsigned(checked)} />
           </Form.Item>
           <Form.Item name="description" label="描述">
             <Input placeholder="可选描述" />

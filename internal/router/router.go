@@ -95,6 +95,9 @@ func Setup(
 	k8sMgmtH := newK8sMgmtHandler(db, cfg)
 	k8sMgmtH.registerRoutes(ws)
 
+	aiReportH := newAIReportHandler(db, cfg)
+	aiReportH.registerRoutes(ws)
+
 	container.Add(ws)
 
 	// Second WebService for the Alertmanager v2 wire-compatible endpoint.

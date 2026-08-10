@@ -257,22 +257,27 @@ export interface SilencePolicy {
 /** gjson paths into the signed webhook JSON → RawAlert (see docs/log-alert-denoising.md). */
 export interface WebhookPayloadMapping {
   alertname_path: string
-  severity_path: string
+  severity_path?: string
+  default_severity?: string
   service_path?: string
   description_path?: string
   summary_path?: string
   starts_at_path?: string
   fingerprint_path?: string
   label_paths?: Record<string, string>
+  status_path?: string
+  status_firing_value?: string
+  status_resolved_value?: string
 }
 
 export interface WebhookSource {
   id: string
   name: string
-  client_id: string
-  public_key: string
+  client_id?: string
+  public_key?: string
   allow_skew: number
   is_enabled: boolean
+  is_unsigned?: boolean
   description?: string
   /** Body → RawAlert field paths (OpenSearch/Elastic/Kibana alerting, etc.). */
   mapping?: WebhookPayloadMapping

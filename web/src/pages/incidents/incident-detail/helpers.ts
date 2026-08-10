@@ -94,6 +94,19 @@ export function truncateInline(s: string, max: number): string {
   return arr.slice(0, max).join('') + '…'
 }
 
+// base64ToUtf8 decodes a base64 string into a UTF-8 string.
+// atob() alone corrupts multi-byte characters (e.g. Chinese) because it
+// treats each byte as a Latin-1 character; we must reassemble the bytes
+// and decode them as UTF-8.
+function base64ToUtf8(base64: string): string {
+  const binary = atob(base64)
+  const bytes = new Uint8Array(binary.length)
+  for (let i = 0; i < binary.length; i++) {
+    bytes[i] = binary.charCodeAt(i)
+  }
+  return new TextDecoder().decode(bytes)
+}
+
 // decodeRawPayload turns the on-wire raw_payload (base64-encoded []byte from
 // the Go model) into a pretty-printed JSON string when possible. Returns
 // undefined when the field is absent so callers can simply skip the
@@ -103,7 +116,7 @@ export function decodeRawPayload(raw: string | null | undefined): string | undef
   if (!raw) return undefined
   let decoded = raw
   try {
-    decoded = atob(raw)
+    decoded = base64ToUtf8(raw)
   } catch {
     // Not base64 — keep the original (some adapters may send a raw JSON
     // string in the future, and we don't want to swallow that).

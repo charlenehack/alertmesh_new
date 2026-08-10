@@ -210,6 +210,12 @@ func (o *Orchestrator) processNextTask(ctx context.Context, _ interface{}) {
 	report, err := agent.Analyze(ctx, task.IncidentID, cb)
 
 	if err != nil {
+		log.Error().
+			Err(err).
+			Str("incident_id", task.IncidentID).
+			Str("task_id", task.ID).
+			Msg("AI analysis failed")
+
 		o.db.Model(&task).Updates(map[string]interface{}{
 			"status": model.AIStatusFailed,
 			"error":  err.Error(),

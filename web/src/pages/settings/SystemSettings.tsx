@@ -176,7 +176,7 @@ const LIFECYCLE_KEYS = {
   reopen: 'incident.reopen_window',
 } as const
 
-const DURATION_PRESETS = ['5m', '10m', '30m', '1h', '2h', '6h']
+const DURATION_PRESETS = ['0', '5m', '10m', '30m', '1h', '2h', '6h']
 
 // v3 schedule schema mirrored on the frontend.  Kept structurally
 // identical to internal/incident/service.go::rawScheduleV3 so the
@@ -281,7 +281,7 @@ function LifecycleSettingsCard() {
 
   const initialValues = useMemo(() => ({
     schedule: parseScheduleValue(lookup[LIFECYCLE_KEYS.schedule]),
-    [LIFECYCLE_KEYS.staleness]: lookup[LIFECYCLE_KEYS.staleness] ?? '10m',
+    [LIFECYCLE_KEYS.staleness]: lookup[LIFECYCLE_KEYS.staleness] ?? '0',
     [LIFECYCLE_KEYS.reopen]: lookup[LIFECYCLE_KEYS.reopen] ?? '5m',
   }), [lookup])
 
@@ -542,14 +542,15 @@ function LifecycleSettingsCard() {
           extra={
             <Text type="secondary" style={{ fontSize: 12 }}>
               Go duration（如 <Text code>10m</Text>、<Text code>30m</Text>）。Open 状态下超过此窗口未再收到告警，
-              后台 reaper 将自动标记为已解决并发送 [RESOLVED] 通知。
+              后台 reaper 将自动标记为已解决并发送 [RESOLVED] 通知。填 <Text code>0</Text> 则禁用自动恢复，
+              必须收到明确的恢复消息（如腾讯云 alarmStatus=0）才会标记为已解决。
             </Text>
           }
           rules={[{ required: true, message: '请填写超时时长' }, durationRule]}
         >
           <Input
             style={{ maxWidth: 240 }}
-            placeholder="10m"
+            placeholder="0"
             addonAfter={
               <DurationPresets onPick={(v) => form.setFieldValue(LIFECYCLE_KEYS.staleness, v)} />
             }
@@ -614,11 +615,13 @@ function DurationPresets({ onPick }: { onPick: (v: string) => void }) {
 const durationRule = {
   validator: (_: unknown, value: string) => {
     if (!value) return Promise.resolve()
-    // Same regex Go's time.ParseDuration accepts (subset: ns, us, ms, s, m, h).
-    if (/^(?:\d+(?:\.\d+)?(?:ns|us|µs|ms|s|m|h))+$/.test(value.trim())) {
+    const v = value.trim()
+    // 0 disables the staleness reaper / reopen window.
+    if (v === '0') return Promise.resolve()
+    if (/^(?:\d+(?:\.\d+)?(?:ns|us|µs|ms|s|m|h))+$/.test(v)) {
       return Promise.resolve()
     }
-    return Promise.reject(new Error('需为 Go duration 字符串，例如 30s / 5m / 2h'))
+    return Promise.reject(new Error('需为 Go duration 字符串，例如 30s / 5m / 2h，填 0 禁用'))
   },
 }
 

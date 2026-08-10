@@ -38,7 +38,12 @@ const stalenessScanInterval = 30 * time.Second
 // Returns immediately and runs until ctx is cancelled.
 func StartStalenessReaper(ctx context.Context, db *gorm.DB, svc *Service) {
 	go func() {
-		log.Info().Dur("interval", stalenessScanInterval).Msg("incident staleness reaper started")
+		timeout := svc.StalenessTimeout(ctx)
+		log.Info().
+			Dur("interval", stalenessScanInterval).
+			Dur("staleness_timeout", timeout).
+			Bool("enabled", timeout > 0).
+			Msg("incident staleness reaper started")
 		ticker := time.NewTicker(stalenessScanInterval)
 		defer ticker.Stop()
 
@@ -57,8 +62,10 @@ func StartStalenessReaper(ctx context.Context, db *gorm.DB, svc *Service) {
 func stalenessScanOnce(ctx context.Context, db *gorm.DB, svc *Service) {
 	timeout := svc.StalenessTimeout(ctx)
 	if timeout <= 0 {
+		log.Debug().Dur("staleness_timeout", timeout).Msg("staleness reaper: disabled")
 		return
 	}
+	log.Debug().Dur("staleness_timeout", timeout).Msg("staleness reaper: scanning")
 	cutoff := time.Now().Add(-timeout)
 
 	var stale []model.Incident

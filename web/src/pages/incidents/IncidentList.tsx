@@ -1,4 +1,4 @@
-import { useState } from 'react'
+import { useState, useEffect } from 'react'
 import { useQuery, useQueryClient } from '@tanstack/react-query'
 import {
   Table, Tag, Button, Input, Select, Typography, Tooltip
@@ -28,8 +28,15 @@ export default function IncidentList() {
   const [search, setSearch] = useState('')
   const [severityFilter, setSeverityFilter] = useState<string>('')
   const [statusFilter, setStatusFilter] = useState<string>('')
+  const [, setTick] = useState(0)
 
-  const { data, isLoading, refetch } = useQuery({
+  // 每分钟触发一次重渲染，让 fromNow() 时间文字自动更新
+  useEffect(() => {
+    const timer = setInterval(() => setTick(t => t + 1), 60_000)
+    return () => clearInterval(timer)
+  }, [])
+
+  const { data, isLoading } = useQuery({
     queryKey: ['incidents', page],
     queryFn: () => getIncidents((page - 1) * PAGE_SIZE, PAGE_SIZE),
   })
@@ -146,7 +153,10 @@ export default function IncidentList() {
         </div>
         <Button
           icon={<ReloadOutlined />}
-          onClick={() => refetch()}
+          onClick={() => {
+            setPage(1)
+            qc.invalidateQueries({ queryKey: ['incidents'] })
+          }}
           style={{ borderColor: c.borderStrong, color: c.textSecondary }}
         >
           刷新
