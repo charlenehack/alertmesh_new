@@ -113,6 +113,14 @@ func (a *Agent) Analyze(ctx context.Context, incidentID string, cb callbacks.Han
 
 	// Anthropic models (especially Claude 3.7 with thinking blocks) trip up
 	// langchaingo's SSE/agent parsers. Use a direct Messages API ReAct loop.
+	if provider.Provider == "qoder" {
+		qc, err := newQoderClient(provider.BaseURL, apiKey, provider.ModelName)
+		if err != nil {
+			return "", fmt.Errorf("create qoder client: %w", err)
+		}
+		return qc.Generate(ctx, prompt)
+	}
+
 	if provider.Provider == "anthropic" {
 		log.Info().
 			Str("incident_id", incidentID).
@@ -216,6 +224,14 @@ func (a *Agent) Chat(ctx context.Context, incidentID, question string, history [
 
 	// Anthropic models (especially Claude 3.7 with thinking blocks) trip up
 	// langchaingo's SSE/agent parsers. Use a direct Messages API ReAct loop.
+	if provider.Provider == "qoder" {
+		qc, err := newQoderClient(provider.BaseURL, apiKey, provider.ModelName)
+		if err != nil {
+			return "", fmt.Errorf("create qoder client: %w", err)
+		}
+		return qc.Generate(ctx, prompt)
+	}
+
 	if provider.Provider == "anthropic" {
 		log.Debug().
 			Str("incident_id", incidentID).
@@ -811,6 +827,10 @@ func (a *Agent) AnalyzeK8s(ctx context.Context, req AnalyzeK8sRequest, onToken f
 
 	// Use direct HTTP streaming for Anthropic to avoid langchaingo SSE parsing bugs.
 	// For other providers fall back to langchaingo.
+	if provider.Provider == "qoder" {
+		return streamQoderDirect(ctx, apiKey, provider.BaseURL, provider.ModelName, prompt, onToken)
+	}
+
 	if provider.Provider == "anthropic" {
 		return streamAnthropicDirect(ctx, apiKey, provider.BaseURL, provider.ModelName, prompt, onToken)
 	}
@@ -831,6 +851,21 @@ func (a *Agent) AnalyzeK8s(ctx context.Context, req AnalyzeK8sRequest, onToken f
 		}),
 	)
 	return err
+}
+
+// streamQoderDirect calls the Qoder Cloud Agents API directly.
+// It creates a fresh Session per call and returns the first text response.
+func streamQoderDirect(ctx context.Context, apiKey, baseURL, modelName, prompt string, onToken func(string)) error {
+	qc, err := newQoderClient(baseURL, apiKey, modelName)
+	if err != nil {
+		return err
+	}
+	reply, err := qc.Generate(ctx, prompt)
+	if err != nil {
+		return err
+	}
+	onToken(reply)
+	return nil
 }
 
 // streamAnthropicDirect calls the Anthropic Messages API directly via HTTP streaming,
@@ -1247,6 +1282,10 @@ func (a *Agent) AnalyzePeriod(ctx context.Context, input PeriodReportInput, onTo
 		Str("provider", provider.Provider).
 		Msg("starting period AI report")
 
+	if provider.Provider == "qoder" {
+		return streamQoderDirect(ctx, apiKey, provider.BaseURL, provider.ModelName, prompt, onToken)
+	}
+
 	if provider.Provider == "anthropic" {
 		return streamAnthropicDirect(ctx, apiKey, provider.BaseURL, provider.ModelName, prompt, onToken)
 	}
@@ -1435,4 +1474,178 @@ func buildIncidentListBlock(incidents []model.Incident) string {
 			inc.Severity, inc.Title, inc.Source, len(inc.Alerts), inc.Status, dur)
 	}
 	return b.String()
+}
+
+// ─── Observability Query Generation ──────────────────────────────────────────
+
+// GenerateObservabilityQuery turns a natural-language request into a query
+// string for the given data source kind (prometheus / opensearch / elastic).
+// The generated text is streamed to onToken and is expected to be a single
+// PromQL expression or a JSON DSL without Markdown fences.
+func (a *Agent) GenerateObservabilityQuery(ctx context.Context, kind, naturalLanguage string, onToken func(string)) error {
+	var provider model.LLMProvider
+	if err := a.db.WithContext(ctx).Where("is_default = ? AND is_enabled = ?", true, true).First(&provider).Error; err != nil {
+		return fmt.Errorf("no default LLM provider configured: %w", err)
+	}
+
+	apiKey, err := a.decryptAPIKey(provider.APIKey)
+	if err != nil {
+		return fmt.Errorf("decrypt LLM API key: %w", err)
+	}
+
+	language := resolveLanguage(provider)
+	prompt := buildObservabilityQueryPrompt(kind, naturalLanguage, language)
+
+	log.Info().
+		Str("kind", kind).
+		Str("language", language).
+		Msg("generating observability query from natural language")
+
+	if provider.Provider == "qoder" {
+		return streamQoderDirect(ctx, apiKey, provider.BaseURL, provider.ModelName, prompt, onToken)
+	}
+
+	if provider.Provider == "anthropic" {
+		return streamAnthropicDirect(ctx, apiKey, provider.BaseURL, provider.ModelName, prompt, onToken)
+	}
+
+	llmModel, err := newLLMFromProvider(provider, apiKey, nil)
+	if err != nil {
+		return fmt.Errorf("create LLM client: %w", err)
+	}
+	_, err = llmModel.GenerateContent(ctx,
+		[]llms.MessageContent{
+			{Role: llms.ChatMessageTypeHuman, Parts: []llms.ContentPart{llms.TextPart(prompt)}},
+		},
+		llms.WithStreamingFunc(func(_ context.Context, chunk []byte) error {
+			if len(chunk) > 0 {
+				onToken(string(chunk))
+			}
+			return nil
+		}),
+	)
+	return err
+}
+
+func buildObservabilityQueryPrompt(kind, naturalLanguage, language string) string {
+	now := time.Now().Format("2006-01-02 15:04:05")
+
+	switch strings.ToLower(kind) {
+	case "prometheus":
+		if language == "en" {
+			return fmt.Sprintf(`You are a senior SRE. Generate a PromQL query for the following request.
+Current time: %s
+Data source: Prometheus
+Common metrics: nginx_requests_total, node_cpu_seconds_total, node_memory_MemAvailable_bytes, node_filesystem_avail_bytes, container_cpu_usage_seconds_total
+
+Request: %s
+
+Output ONLY the PromQL expression. Do not include explanations, markdown code fences, or any other text.`, now, naturalLanguage)
+		}
+		return fmt.Sprintf(`你是一名资深 SRE，请根据以下自然语言请求生成一条 PromQL 查询语句。
+当前时间：%s
+数据源：Prometheus
+常见指标：nginx_requests_total, node_cpu_seconds_total, node_memory_MemAvailable_bytes, node_filesystem_avail_bytes, container_cpu_usage_seconds_total
+
+请求：%s
+
+只输出 PromQL 查询语句，不要解释、不要 Markdown 代码块、不要其他文字。`, now, naturalLanguage)
+
+	case "opensearch", "elastic":
+		if language == "en" {
+			return fmt.Sprintf(`You are a senior SRE. Generate an OpenSearch/Elasticsearch query DSL JSON for the following request.
+Current time: %s
+Data source: %s
+Common fields: @timestamp, level, message, status_code, host.name, kubernetes.pod.name, request_path, response_time
+
+Request: %s
+
+Output ONLY a valid JSON object suitable for the "query" field of an OpenSearch DSL search body. Do not include explanations, markdown code fences, or any other text.`, now, kind, naturalLanguage)
+		}
+		return fmt.Sprintf(`你是一名资深 SRE，请根据以下自然语言请求生成一段 OpenSearch/Elasticsearch 查询 DSL JSON。
+当前时间：%s
+数据源：%s
+常见字段：@timestamp, level, message, status_code, host.name, kubernetes.pod.name, request_path, response_time
+
+请求：%s
+
+只输出可用于 OpenSearch DSL "query" 字段的合法 JSON 对象，不要解释、不要 Markdown 代码块、不要其他文字。`, now, kind, naturalLanguage)
+
+	default:
+		return fmt.Sprintf(`You are a senior SRE. Generate a query for data source kind %q based on this request: %s
+Output ONLY the query string.`, kind, naturalLanguage)
+	}
+}
+
+// SummarizeObservabilityResult asks the default LLM to produce a concise,
+// human-readable summary of an observability query result.
+func (a *Agent) SummarizeObservabilityResult(ctx context.Context, kind, naturalLanguage, resultJSON string) (string, error) {
+	var provider model.LLMProvider
+	if err := a.db.WithContext(ctx).Where("is_default = ? AND is_enabled = ?", true, true).First(&provider).Error; err != nil {
+		return "", fmt.Errorf("no default LLM provider configured: %w", err)
+	}
+
+	apiKey, err := a.decryptAPIKey(provider.APIKey)
+	if err != nil {
+		return "", fmt.Errorf("decrypt LLM API key: %w", err)
+	}
+
+	language := resolveLanguage(provider)
+	prompt := buildObservabilitySummaryPrompt(kind, naturalLanguage, resultJSON, language)
+
+	log.Info().
+		Str("kind", kind).
+		Str("language", language).
+		Msg("summarizing observability query result")
+
+	var buf strings.Builder
+	onToken := func(s string) { buf.WriteString(s) }
+
+	switch provider.Provider {
+	case "qoder":
+		err = streamQoderDirect(ctx, apiKey, provider.BaseURL, provider.ModelName, prompt, onToken)
+	case "anthropic":
+		err = streamAnthropicDirect(ctx, apiKey, provider.BaseURL, provider.ModelName, prompt, onToken)
+	default:
+		llmModel, err := newLLMFromProvider(provider, apiKey, nil)
+		if err != nil {
+			return "", fmt.Errorf("create LLM client: %w", err)
+		}
+		_, err = llmModel.GenerateContent(ctx,
+			[]llms.MessageContent{
+				{Role: llms.ChatMessageTypeHuman, Parts: []llms.ContentPart{llms.TextPart(prompt)}},
+			},
+			llms.WithStreamingFunc(func(_ context.Context, chunk []byte) error {
+				if len(chunk) > 0 {
+					onToken(string(chunk))
+				}
+				return nil
+			}),
+		)
+	}
+	if err != nil {
+		return "", err
+	}
+	return strings.TrimSpace(buf.String()), nil
+}
+
+func buildObservabilitySummaryPrompt(kind, naturalLanguage, resultJSON, language string) string {
+	if language == "en" {
+		return fmt.Sprintf(`You are a senior SRE. A query was executed for the following request:
+
+Request: %s
+Data source: %s
+Result (JSON):
+%s
+
+Provide a concise 1-3 sentence summary in English of the key findings. No markdown, no bullet points, just plain text.`, naturalLanguage, kind, resultJSON)
+	}
+	return fmt.Sprintf(`你是一名资深 SRE。针对以下请求执行了一次查询：
+
+请求：%s
+数据源：%s
+查询结果（JSON）：
+%s
+
+请用 1-3 句话概括关键发现，使用简体中文。不要 Markdown、不要列表，只输出纯文本。`, naturalLanguage, kind, resultJSON)
 }

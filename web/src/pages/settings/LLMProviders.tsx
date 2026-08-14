@@ -34,6 +34,7 @@ const PROVIDER_OPTIONS = [
   { value: 'azure', label: 'Azure OpenAI' },
   { value: 'ollama', label: 'Ollama (native)' },
   { value: 'anthropic', label: 'Anthropic Claude' },
+  { value: 'qoder', label: 'Qoder Cloud Agents' },
 ]
 
 /**
@@ -53,6 +54,7 @@ export default function LLMProviders() {
   const [editing, setEditing] = useState<LLMProvider | null>(null)
   const [form] = Form.useForm()
   const [testing, setTesting] = useState<string | null>(null)
+  const provider = Form.useWatch('provider', form)
 
   const { data, isLoading } = useQuery({
     queryKey: ['llm-providers'],
@@ -373,39 +375,49 @@ export default function LLMProviders() {
 
           <Form.Item
             name="base_url"
-            label="Base URL"
+            label={provider === 'qoder' ? 'Qoder API 网关' : 'Base URL'}
             extra={
               <span style={{ color: c.textTertiary, fontSize: 11 }}>
-                官方 OpenAI 留空；DeepSeek 填 <Text code style={{ fontSize: 11 }}>https://api.deepseek.com/v1</Text>；
-                Ollama 填 <Text code style={{ fontSize: 11 }}>http://localhost:11434/v1</Text>
+                {provider === 'qoder'
+                  ? <>国际站填 <Text code style={{ fontSize: 11 }}>https://api.qoder.com</Text>；中国站填 <Text code style={{ fontSize: 11 }}>https://api.qoder.com.cn</Text></>
+                  : <>官方 OpenAI 留空；DeepSeek 填 <Text code style={{ fontSize: 11 }}>https://api.deepseek.com/v1</Text>；
+                    Ollama 填 <Text code style={{ fontSize: 11 }}>http://localhost:11434/v1</Text></>}
               </span>
             }
           >
-            <Input placeholder="https://api.deepseek.com/v1" />
+            <Input placeholder={provider === 'qoder' ? 'https://api.qoder.com' : 'https://api.deepseek.com/v1'} />
           </Form.Item>
 
           <Form.Item
             name="model"
-            label="模型名称"
-            rules={[{ required: true, message: '模型必填' }]}
-            extra={<span style={{ color: c.textTertiary, fontSize: 11 }}>例如 gpt-4o-mini / deepseek-chat / qwen2.5:7b-instruct</span>}
+            label={provider === 'qoder' ? 'Agent / Environment' : '模型名称'}
+            rules={[{ required: true, message: provider === 'qoder' ? 'Agent 与 Environment 必填' : '模型必填' }]}
+            extra={
+              <span style={{ color: c.textTertiary, fontSize: 11 }}>
+                {provider === 'qoder'
+                  ? <>格式 <Text code style={{ fontSize: 11 }}>agent_id|environment_id</Text>，例如 <Text code style={{ fontSize: 11 }}>agent_019e...|env_019e...</Text></>
+                  : '例如 gpt-4o-mini / deepseek-chat / qwen2.5:7b-instruct'}
+              </span>
+            }
           >
-            <Input placeholder="deepseek-chat" />
+            <Input placeholder={provider === 'qoder' ? 'agent_xxx|env_xxx' : 'deepseek-chat'} />
           </Form.Item>
 
           <Form.Item
             name="api_key"
-            label="API Key"
-            rules={editing ? [] : [{ required: true, message: 'API Key 必填' }]}
+            label={provider === 'qoder' ? 'PAT（Personal Access Token）' : 'API Key'}
+            rules={editing ? [] : [{ required: true, message: provider === 'qoder' ? 'PAT 必填' : 'API Key 必填' }]}
             extra={
               <span style={{ color: c.textTertiary, fontSize: 11 }}>
-                {editing
-                  ? '保留 ****** 表示不修改；输入新值将通过 RSA 加密传输并重新落库。'
-                  : '提交前由浏览器使用系统公钥 RSA 加密（ENC: 前缀），落库时再 AES-256-GCM 加密；列表接口仅返回 ******。'}
+                {provider === 'qoder'
+                  ? '在 Qoder 控制台 → 访问令牌中创建的 PAT。'
+                  : (editing
+                    ? '保留 ****** 表示不修改；输入新值将通过 RSA 加密传输并重新落库。'
+                    : '提交前由浏览器使用系统公钥 RSA 加密（ENC: 前缀），落库时再 AES-256-GCM 加密；列表接口仅返回 ******。')}
               </span>
             }
           >
-            <Input.Password placeholder={editing ? API_KEY_MASK : 'sk-…'} autoComplete="new-password" />
+            <Input.Password placeholder={editing ? API_KEY_MASK : (provider === 'qoder' ? 'qoder_pat_…' : 'sk-…')} autoComplete="new-password" />
           </Form.Item>
 
           <Form.Item

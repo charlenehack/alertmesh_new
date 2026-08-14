@@ -127,7 +127,7 @@ func ProvideHTTPServer(cfg *config.Config, container *restful.Container) *http.S
 		Addr:              fmt.Sprintf(":%d", cfg.ServerPort),
 		Handler:           mux,
 		ReadHeaderTimeout: 30 * time.Second,  // 只限制 header 读取时间，body（文件上传）不受此限制
-		WriteTimeout:      120 * time.Second, // 必要时容许长时间响应（如终端会话）
-		IdleTimeout:       120 * time.Second,
+		WriteTimeout:      300 * time.Second, // 匹配 K8s AI 分析前端 300s 超时
+		IdleTimeout:       300 * time.Second,
 	}
 }

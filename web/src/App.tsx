@@ -36,6 +36,7 @@ const SystemSettings = lazy(() => import('./pages/settings/SystemSettings'))
 const LLMProviders = lazy(() => import('./pages/settings/LLMProviders'))
 const DataSources = lazy(() => import('./pages/datasources/DataSources'))
 const PromExplore = lazy(() => import('./pages/datasources/PromExplore'))
+const ObservabilityQuery = lazy(() => import('./pages/observability/ObservabilityQuery'))
 const NginxConfig = lazy(() => import('./pages/services/NginxConfig'))
 const SysInit = lazy(() => import('./pages/services/SysInit'))
 const WafConfig = lazy(() => import('./pages/services/WafConfig'))
@@ -119,6 +120,7 @@ function ThemedApp() {
               <Route path="alert/templates" element={<NotificationTemplates />} />
               <Route path="alert/webhook-sources" element={<WebhookSources />} />
               <Route path="alert/reports" element={<AIReports />} />
+              <Route path="observability/query" element={<ObservabilityQuery />} />
 
               {/* System – admin only (frontend guards in AppLayout) */}
               <Route path="users" element={<UserList />} />

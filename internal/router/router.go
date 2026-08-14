@@ -98,6 +98,9 @@ func Setup(
 	aiReportH := newAIReportHandler(db, cfg)
 	aiReportH.registerRoutes(ws)
 
+	obsH := newObservabilityHandler(db, cfg)
+	obsH.registerRoutes(ws)
+
 	container.Add(ws)
 
 	// Second WebService for the Alertmanager v2 wire-compatible endpoint.

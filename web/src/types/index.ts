@@ -300,7 +300,7 @@ export interface WebhookSourceCreated extends WebhookSource {
 // `api_key` is always returned masked as "******" by the backend so the raw
 // secret never reaches the browser.  When editing, leaving the field blank
 // or as the placeholder keeps the existing ciphertext on the server.
-export type LLMProviderKind = 'openai' | 'azure' | 'ollama' | 'anthropic' | 'deepseek' | string
+export type LLMProviderKind = 'openai' | 'azure' | 'ollama' | 'anthropic' | 'deepseek' | 'qoder' | string
 
 // Output language directive for the AI agent.
 //   zh   – always 简体中文 (default)

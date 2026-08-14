@@ -47,6 +47,7 @@ import (
 	"github.com/tmc/langchaingo/llms/openai"
 	"gorm.io/gorm"
 
+	"github.com/kuzane/alertmesh/internal/ai"
 	"github.com/kuzane/alertmesh/internal/auth"
 	cfgcrypto "github.com/kuzane/alertmesh/internal/config"
 	"github.com/kuzane/alertmesh/internal/httputil"
@@ -398,6 +399,20 @@ func (h *aiHandler) testLLMProvider(req *restful.Request, resp *restful.Response
 	var llm llms.Model
 	var err error
 	switch provider.Provider {
+	case "qoder":
+		qoderCtx, cancel := context.WithTimeout(req.Request.Context(), 90*time.Second)
+		defer cancel()
+		sample, err := ai.TestQoderProvider(qoderCtx, provider.BaseURL, apiKey, provider.ModelName)
+		if err != nil {
+			httputil.Error(resp, http.StatusBadGateway, "test call failed: "+err.Error())
+			return
+		}
+		httputil.Success(resp, map[string]any{
+			"ok":     true,
+			"model":  provider.ModelName,
+			"sample": sample,
+		})
+		return
 	case "anthropic":
 		// Use a direct HTTP call instead of langchaingo so we can skip
 		// "thinking" content blocks that some Anthropic-compatible proxies

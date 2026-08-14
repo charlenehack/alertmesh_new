@@ -253,6 +253,12 @@ export default function AppLayout() {
           label: 'Webhook 可信源',
           onClick: () => navigate('/alert/webhook-sources'),
         }] : []),
+        {
+          key: '/observability/query',
+          icon: <RobotOutlined />,
+          label: '可观测性查询',
+          onClick: () => navigate('/observability/query'),
+        },
       ],
     },
     // System management – admin only
@@ -307,7 +313,7 @@ export default function AppLayout() {
     const keys: string[] = []
     if (path.startsWith('/services')) keys.push('services')
     if (path.startsWith('/k8s')) keys.push('k8s')
-    if (path.startsWith('/incidents') || path.startsWith('/alert')) keys.push('alert-center')
+    if (path.startsWith('/incidents') || path.startsWith('/alert') || path.startsWith('/observability')) keys.push('alert-center')
     if (isAdmin && (path.startsWith('/users') || path.startsWith('/roles') || path.startsWith('/settings') || path.startsWith('/datasources'))) {
       keys.push('system')
     }
